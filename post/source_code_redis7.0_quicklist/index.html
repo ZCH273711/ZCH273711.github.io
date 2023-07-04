@@ -1,0 +1,348 @@
+<html>
+  <head>
+    <meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Redis7.0源码阅读笔记——quicklist | 小崽霸的Blog</title>
+<link rel="shortcut icon" href="https://zch273711.github.io/favicon.ico?v=1688480217261">
+<link href="https://cdn.jsdelivr.net/npm/remixicon@2.3.0/fonts/remixicon.css" rel="stylesheet">
+<link rel="stylesheet" href="https://zch273711.github.io/styles/main.css">
+<link rel="alternate" type="application/atom+xml" title="Redis7.0源码阅读笔记——quicklist | 小崽霸的Blog - Atom Feed" href="https://zch273711.github.io/atom.xml">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Droid+Serif:400,700">
+
+
+
+    <meta name="description" content="quicklist是redis提供的六种基本数据结构中List的底层实现，而quicklist的实现又依赖于listpack数据结构。不过值得注意的是，在7.0版本之前，quicklist的底层实现还是依赖于ziplist，在7.0版本换为..." />
+    <meta name="keywords" content="Redis,SourceCode" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.10.0/katex.min.css">
+    <script src="//cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.5.1/build/highlight.min.js"></script>
+  </head>
+  <body>
+    <div class="main">
+      <div class="main-content">
+        <div class="site-header">
+  <a href="https://zch273711.github.io">
+  <img class="avatar" src="https://zch273711.github.io/images/avatar.png?v=1688480217261" alt="">
+  </a>
+  <h1 class="site-title">
+    小崽霸的Blog
+  </h1>
+  <p class="site-description">
+    温故而知新
+  </p>
+  <div class="menu-container">
+    
+      
+        <a href="/" class="menu">
+          首页
+        </a>
+      
+    
+      
+        <a href="/archives" class="menu">
+          归档
+        </a>
+      
+    
+      
+        <a href="/tags" class="menu">
+          标签
+        </a>
+      
+    
+      
+        <a href="/post/about" class="menu">
+          关于
+        </a>
+      
+    
+  </div>
+  <div class="social-container">
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+  </div>
+</div>
+
+        <div class="post-detail">
+          <article class="post">
+            <h2 class="post-title">
+              Redis7.0源码阅读笔记——quicklist
+            </h2>
+            <div class="post-info">
+              <span>
+                2023-06-12
+              </span>
+              <span>
+                7 min read
+              </span>
+              
+                <a href="https://zch273711.github.io/tag/Vc-OScUw0/" class="post-tag">
+                  # Redis
+                </a>
+              
+                <a href="https://zch273711.github.io/tag/LTQFX9TqG/" class="post-tag">
+                  # SourceCode
+                </a>
+              
+            </div>
+            
+            <div class="post-content-wrapper">
+              <div class="post-content" v-pre>
+                <p>quicklist是redis提供的六种基本数据结构中List的底层实现，而quicklist的实现又依赖于listpack数据结构。不过值得注意的是，在7.0版本之前，quicklist的底层实现还是依赖于ziplist，在7.0版本换为了listpack结构。</p>
+<p>在quicklist.c文件开头，就对quicklist进行了很精简的概括——quicklist是一个双向链接的listpack链表。</p>
+<h2 id="quicklist结构体">quicklist结构体</h2>
+<h3 id="quicklistnode">quicklistNode</h3>
+<p>首先看quicklist相关的结构体，和quicklist相关的结构体都在quicklist.h文件中。首先是quicklistNode结构体。代表quicklist中的一个节点。字段说明如下：</p>
+<ul>
+<li>prev，指向前一个结点的指针；</li>
+<li>next，指向后一个节点的指针；</li>
+<li>entry，指向一个listpack结构体或quicklistLZF结构体（下面会介绍）；</li>
+<li>sz，entry指向的结构体所占用的空间；</li>
+<li>count，entry指向的listpack中元素的个数；</li>
+<li>encoding，当前节点的编码方式，分为原生和压缩两种，如果是压缩，则entry指向quicklistLZF结构体；</li>
+</ul>
+<p>其他字段看注释了解即可。</p>
+<pre><code class="language-c">typedef struct quicklistNode {
+    struct quicklistNode *prev;
+    struct quicklistNode *next;
+    unsigned char *entry;
+    size_t sz;             /* entry size in bytes */
+    unsigned int count : 16;     /* count of items in listpack */
+    unsigned int encoding : 2;   /* RAW==1 or LZF==2 */
+    unsigned int container : 2;  /* PLAIN==1 or PACKED==2 */
+    unsigned int recompress : 1; /* was this node previous compressed? */
+    unsigned int attempted_compress : 1; /* node can't compress; too small */
+    unsigned int dont_compress : 1; /* prevent compression of entry that will be used later */
+    unsigned int extra : 9; /* more bits to steal for future usage */
+} quicklistNode;
+</code></pre>
+<h3 id="quicklistlzf">quicklistLZF</h3>
+<p>代码如下。为了在listpack的基础上再提升内存空间的使用效率，于是采用LZF算法对quicklist中间节点进行压缩。sz表示后面被压缩内容的字节空间，后面compressed存储被压缩的数据。</p>
+<pre><code class="language-c">typedef struct quicklistLZF {
+    size_t sz; /* LZF size in bytes*/
+    char compressed[];
+} quicklistLZF;
+</code></pre>
+<h3 id="quicklist">quicklist</h3>
+<p>代表整个quicklist，代码如下。对其中几个字段进行说明。fill如果是正数，表示链表中每个节点listpack中允许的最大元素个数，如果是负数，表示listpack的最大空间；compress代表两端各有compress个节点不会进行压缩；</p>
+<pre><code class="language-c">typedef struct quicklist {
+    quicklistNode *head;
+    quicklistNode *tail;
+    unsigned long count;        /* total count of all entries in all listpacks */
+    unsigned long len;          /* number of quicklistNodes */
+    signed int fill : QL_FILL_BITS;       /* fill factor for individual nodes */
+    unsigned int compress : QL_COMP_BITS; /* depth of end nodes not to compress;0=off */
+    unsigned int bookmark_count: QL_BM_BITS;
+    quicklistBookmark bookmarks[];
+} quicklist;
+</code></pre>
+<h3 id="quicklistentry">quicklistEntry</h3>
+<p>为了方便使用listpack中的元素，提供的一个结构体，代码如下。quicklist指向当前元素所在的quicklist; node指向当前元素所在的quicklistNode结构；zi指向当前元素所在的listpack;value指向该节点的字符串内容；longval为该节点的整型值；sz代表该节点的大小，与value配合使用；offset表明该节点相对于整个listpack的偏移量，即该节点是listpack第多少个entry。</p>
+<pre><code class="language-c">typedef struct quicklistEntry {
+    const quicklist *quicklist;
+    quicklistNode *node;
+    unsigned char *zi;
+    unsigned char *value;
+    long long longval;
+    size_t sz;
+    int offset;
+} quicklistEntry;
+</code></pre>
+<p>有关quicklist的压缩算法就不再深入分析，如果需要可以单独了解LZF压缩算法。</p>
+<h2 id="quicklist的创建">quicklist的创建</h2>
+<p>比较简单，直接上代码。分配空间然后给各个字段初始化即可。</p>
+<pre><code class="language-c">quicklist *quicklistCreate(void) {
+    struct quicklist *quicklist;
+
+    quicklist = zmalloc(sizeof(*quicklist));
+    quicklist-&gt;head = quicklist-&gt;tail = NULL;
+    quicklist-&gt;len = 0;
+    quicklist-&gt;count = 0;
+    quicklist-&gt;compress = 0;
+    quicklist-&gt;fill = -2;
+    quicklist-&gt;bookmark_count = 0;
+    return quicklist;
+}
+</code></pre>
+<p>除了创建新的quicklist，还可以通过quicklistNew自定义fill和compress字段创建。</p>
+<pre><code class="language-c">quicklist *quicklistNew(int fill, int compress) {
+    quicklist *quicklist = quicklistCreate();
+    quicklistSetOptions(quicklist, fill, compress);
+    return quicklist;
+}
+</code></pre>
+<p>除了创建操作，还提供了一些函数可以设置quicklist的一些字段，这些函数声明如下</p>
+<pre><code class="language-c">void quicklistSetCompressDepth(quicklist *quicklist, int depth);
+void quicklistSetFill(quicklist *quicklist, int fill);
+void quicklistSetOptions(quicklist *quicklist, int fill, int depth);
+</code></pre>
+<h2 id="quicklist添加元素">quicklist添加元素</h2>
+<p>添加元素主要是由quicklistPushHead和quicklistPushTail函数完成的。不过两者的逻辑和步骤都差不多，所以看quicklistPushHead就行了，代码如下。value指向添加的元素，sz是添加源的长度。如果再添加元素的过程中增加了节点，则返回1，否则返回0。其中unlikely和likely是两个宏定义，由__builtin_expect内建函数实现，用来进行分支预测和优化，这里不详细介绍。</p>
+<p>总的来说，这函数会先判断节点是否允许继续插入，如果允许则直接调用listpack的函数添加元素，否则需要创建新的节点，并进行添加元素。需要注意的是，新建的节点都是默认未压缩的。最后函数会更新count和len。</p>
+<pre><code class="language-c">int quicklistPushHead(quicklist *quicklist, void *value, size_t sz) {
+    quicklistNode *orig_head = quicklist-&gt;head;
+
+    if (unlikely(isLargeElement(sz))) {
+        __quicklistInsertPlainNode(quicklist, quicklist-&gt;head, value, sz, 0);
+        return 1;
+    }
+
+    if (likely(
+            _quicklistNodeAllowInsert(quicklist-&gt;head, quicklist-&gt;fill, sz))) {
+        quicklist-&gt;head-&gt;entry = lpPrepend(quicklist-&gt;head-&gt;entry, value, sz);
+        quicklistNodeUpdateSz(quicklist-&gt;head);
+    } else {
+        quicklistNode *node = quicklistCreateNode();
+        node-&gt;entry = lpPrepend(lpNew(0), value, sz);
+
+        quicklistNodeUpdateSz(node);
+        _quicklistInsertNodeBefore(quicklist, quicklist-&gt;head, node);
+    }
+    quicklist-&gt;count++;
+    quicklist-&gt;head-&gt;count++;
+    return (orig_head != quicklist-&gt;head);
+}
+</code></pre>
+<p>上面使用到的_quicklistInsertNodeBefore函数是在特定节点之前插入新的节点，该函数的实现直接调用了__quicklistInsertNode函数。</p>
+<h2 id="quicklist删除元素">quicklist删除元素</h2>
+<p>由quicklistDelEntry实现，代码如下。删除的行为直接由quicklistDelIndex函数实现，然后由迭代器的方向决定当前元素的更新。quicklistDelIndex函数如果删除了整个Node则返回1，如果当前元素被删除了但是Node依然存在，则返回0。</p>
+<pre><code class="language-c">void quicklistDelEntry(quicklistIter *iter, quicklistEntry *entry) {
+    quicklistNode *prev = entry-&gt;node-&gt;prev;
+    quicklistNode *next = entry-&gt;node-&gt;next;
+    int deleted_node = quicklistDelIndex((quicklist *)entry-&gt;quicklist,
+                                         entry-&gt;node, &amp;entry-&gt;zi);
+
+    /* after delete, the zi is now invalid for any future usage. */
+    iter-&gt;zi = NULL;
+
+    /* If current node is deleted, we must update iterator node and offset. */
+    if (deleted_node) {
+        if (iter-&gt;direction == AL_START_HEAD) {
+            iter-&gt;current = next;
+            iter-&gt;offset = 0;
+        } else if (iter-&gt;direction == AL_START_TAIL) {
+            iter-&gt;current = prev;
+            iter-&gt;offset = -1;
+        }
+    }
+}
+</code></pre>
+<p>除了使用上面的函数进行指定位置删除，还可以使用quicklistPop函数直接弹出头或尾部元素。除此之外，还有quicklistDelRange函数可以一次性删除多个元素。</p>
+<h2 id="quicklist更改元素">quicklist更改元素</h2>
+<p>由quicklistReplaceAtIndex函数完成，代码如下。首先创建一个迭代器，然后调用quicklistReplaceEntry函数完成替换，最后释放迭代器。如果更改元素完成，则返回1，否则返回0。</p>
+<pre><code class="language-c">int quicklistReplaceAtIndex(quicklist *quicklist, long index, void *data,
+                            size_t sz) {
+    quicklistEntry entry;
+    quicklistIter *iter = quicklistGetIteratorEntryAtIdx(quicklist, index, &amp;entry);
+    if (likely(iter)) {
+        quicklistReplaceEntry(iter, &amp;entry, data, sz);
+        quicklistReleaseIterator(iter);
+        return 1;
+    } else {
+        return 0;
+    }
+}
+</code></pre>
+<h2 id="quicklist获取元素">quicklist获取元素</h2>
+<p>目前在quicklist提供的API中，主要是通过迭代器来获取元素。首先，可以在特定位置创建一个迭代器，并指定遍历的方向。后面就可以通过quicklistNext函数依次获取元素。</p>
+
+              </div>
+              <div class="toc-container">
+                <ul class="markdownIt-TOC">
+<li>
+<ul>
+<li><a href="#quicklist%E7%BB%93%E6%9E%84%E4%BD%93">quicklist结构体</a>
+<ul>
+<li><a href="#quicklistnode">quicklistNode</a></li>
+<li><a href="#quicklistlzf">quicklistLZF</a></li>
+<li><a href="#quicklist">quicklist</a></li>
+<li><a href="#quicklistentry">quicklistEntry</a></li>
+</ul>
+</li>
+<li><a href="#quicklist%E7%9A%84%E5%88%9B%E5%BB%BA">quicklist的创建</a></li>
+<li><a href="#quicklist%E6%B7%BB%E5%8A%A0%E5%85%83%E7%B4%A0">quicklist添加元素</a></li>
+<li><a href="#quicklist%E5%88%A0%E9%99%A4%E5%85%83%E7%B4%A0">quicklist删除元素</a></li>
+<li><a href="#quicklist%E6%9B%B4%E6%94%B9%E5%85%83%E7%B4%A0">quicklist更改元素</a></li>
+<li><a href="#quicklist%E8%8E%B7%E5%8F%96%E5%85%83%E7%B4%A0">quicklist获取元素</a></li>
+</ul>
+</li>
+</ul>
+
+              </div>
+            </div>
+          </article>
+        </div>
+
+        
+          <div class="next-post">
+            <div class="next">下一篇</div>
+            <a href="https://zch273711.github.io/post/source_code_redis7.0_listpack/">
+              <h3 class="post-title">
+                Redis7.0源码阅读笔记——listpack
+              </h3>
+            </a>
+          </div>
+        
+
+        
+
+        <div class="site-footer">
+  Powered by <a href="https://github.com/getgridea/gridea" target="_blank">Gridea</a>
+  <a class="rss" href="https://zch273711.github.io/atom.xml" target="_blank">
+    <i class="ri-rss-line"></i> RSS
+  </a>
+</div>
+
+      </div>
+    </div>
+
+    <script>
+      hljs.initHighlightingOnLoad()
+
+      let mainNavLinks = document.querySelectorAll(".markdownIt-TOC a");
+
+      // This should probably be throttled.
+      // Especially because it triggers during smooth scrolling.
+      // https://lodash.com/docs/4.17.10#throttle
+      // You could do like...
+      // window.addEventListener("scroll", () => {
+      //    _.throttle(doThatStuff, 100);
+      // });
+      // Only not doing it here to keep this Pen dependency-free.
+
+      window.addEventListener("scroll", event => {
+        let fromTop = window.scrollY;
+
+        mainNavLinks.forEach((link, index) => {
+          let section = document.getElementById(decodeURI(link.hash).substring(1));
+          let nextSection = null
+          if (mainNavLinks[index + 1]) {
+            nextSection = document.getElementById(decodeURI(mainNavLinks[index + 1].hash).substring(1));
+          }
+          if (section.offsetTop <= fromTop) {
+            if (nextSection) {
+              if (nextSection.offsetTop > fromTop) {
+                link.classList.add("current");
+              } else {
+                link.classList.remove("current");    
+              }
+            } else {
+              link.classList.add("current");
+            }
+          } else {
+            link.classList.remove("current");
+          }
+        });
+      });
+
+    </script>
+  </body>
+</html>

@@ -1,0 +1,1721 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+    <id>https://zch273711.github.io</id>
+    <title>小崽霸的Blog</title>
+    <updated>2023-07-04T14:17:03.771Z</updated>
+    <generator>https://github.com/jpmonette/feed</generator>
+    <link rel="alternate" href="https://zch273711.github.io"/>
+    <link rel="self" href="https://zch273711.github.io/atom.xml"/>
+    <subtitle>温故而知新</subtitle>
+    <logo>https://zch273711.github.io/images/avatar.png</logo>
+    <icon>https://zch273711.github.io/favicon.ico</icon>
+    <rights>All rights reserved 2023, 小崽霸的Blog</rights>
+    <entry>
+        <title type="html"><![CDATA[Redis7.0源码阅读笔记——rax]]></title>
+        <id>https://zch273711.github.io/post/source_code_redis7.0_rax/</id>
+        <link href="https://zch273711.github.io/post/source_code_redis7.0_rax/">
+        </link>
+        <updated>2023-06-13T11:56:28.000Z</updated>
+        <content type="html"><![CDATA[<p>rax数据结构是radix树的实现，redis在5.0中加入了消息队列的功能，由Stream实现，而Stream的底层采用了listpack和rax树。其中rax作为消息流的实现基础，在消息流中，以ID为key，使用listpack存储value进行存储每一个消息。</p>
+<p>在了解rax之前，如果对前缀树有一定了解当然是最好的。在前缀树中，每一个节点只存储一个字符，而一个指针的大小就为8字节（64位机器），存在极大的空间浪费，所以，为了解决这个问题，有了rax。</p>
+<h2 id="rax结构体">rax结构体</h2>
+<p>首先看一下rax相关的结构体。</p>
+<h3 id="raxnode">raxNode</h3>
+<p>一共五个字段：</p>
+<ul>
+<li>iskey，1 bit，从根节点到当前节点前一个节点所组成的字符串是否是一个key，如果是，则data字段会存储一个指向value的指针。</li>
+<li>isnull，1 bit，如果上一个字段为1，且当前字段为0（value为NULL），则不会有8字节的指针指向value。</li>
+<li>iscompr，1 bit，当前节点是否为压缩节点，如果是压缩节点，则data中会存储一个字符串，并且只有一个子节点；如果不是压缩节点，则data会存储一个或多个字符，并且每个字符都会有一个子节点。结合redis中rax代码进行举例。
+<ul>
+<li>如果为非压缩节点，则该节点的布局是这样的： [header iscompr=0][abc][a-ptr][b-ptr][c-ptr](value-ptr?)，abc是一个字符串，实际上可以分开看作三个字符，后面按顺序接三个字符对应的三个子节点的指针，最后一个是可选的指向value的指针。</li>
+<li>如果为压缩节点，则该节点的布局是这样的： [header iscompr=1][xyz][z-ptr](value-ptr?)，xyz是一个字符串，后面一个字符串对应的子节点的指针，最后一个是可选的指向value的指针。</li>
+</ul>
+</li>
+<li>size，9 bit，如果是压缩节点，则代表data字段中字符串的长度；如果是非压缩节点，则代表子节点的个数（字符个数）</li>
+<li>data，柔性数组，存放字符（串）以及指针（子节点指针或value指针）。</li>
+</ul>
+<pre><code class="language-c">typedef struct raxNode {
+    uint32_t iskey:1;     /* Does this node contain a key? */
+    uint32_t isnull:1;    /* Associated value is NULL (don't store it). */
+    uint32_t iscompr:1;   /* Node is compressed. */
+    uint32_t size:29;     /* Number of children, or compressed string len. */
+    unsigned char data[];
+} raxNode;
+</code></pre>
+<h3 id="举例子了解rax树的结构">举例子了解rax树的结构</h3>
+<p>压缩之前：对于插入了三个字符串（三个key）的rax树而言，树长下面这样。此时每个节点都是未压缩节点，如果一个节点之前节点组成的字符串是一个key，则在当前节点采用[]表示，否则使用()表示。</p>
+<pre><code class="language-c"> *              (f) &quot;&quot;
+ *                \
+ *                (o) &quot;f&quot;
+ *                  \
+ *                  (o) &quot;fo&quot;
+ *                    \
+ *                  [t   b] &quot;foo&quot;
+ *                  /     \
+ *         &quot;foot&quot; (e)     (a) &quot;foob&quot;
+ *                /         \
+ *      &quot;foote&quot; (r)         (r) &quot;fooba&quot;
+ *              /             \
+ *    &quot;footer&quot; []             [] &quot;foobar&quot;
+</code></pre>
+<p>压缩之后如下所示。压缩就是将连续几个只有单个字符的节点压缩为一个节点表示。</p>
+<pre><code class="language-c"> *                  [&quot;foo&quot;] &quot;&quot;
+ *                     |
+ *                  [t   b] &quot;foo&quot;
+ *                  /     \
+ *        &quot;foot&quot; (&quot;er&quot;)    (&quot;ar&quot;) &quot;foob&quot;
+ *                 /          \
+ *       &quot;footer&quot; []          [] &quot;foobar&quot;
+</code></pre>
+<p>当然，这样的做法会有一个缺点，在注释中也说明了。如果在上面这颗树中想要插入first这个字符串，则需要将节点进行拆分，最后变成下面这样：</p>
+<pre><code class="language-c"> *                    (f) &quot;&quot;
+ *                    /
+ *                 (i o) &quot;f&quot;
+ *                 /   \
+ *    &quot;firs&quot;  (&quot;rst&quot;)  (o) &quot;fo&quot;
+ *              /        \
+ *    &quot;first&quot; []       [t   b] &quot;foo&quot;
+ *                     /     \
+ *           &quot;foot&quot; (&quot;er&quot;)    (&quot;ar&quot;) &quot;foob&quot;
+ *                    /          \
+ *          &quot;footer&quot; []          [] &quot;foobar&quot;
+</code></pre>
+<h3 id="rax">rax</h3>
+<p>rax结构体代表一个rax树，代码如下。numele表示插入树中的字符串个数（key的个数），numnodes表示树种结点的个数。</p>
+<pre><code class="language-c">typedef struct rax {
+    raxNode *head;
+    uint64_t numele;
+    uint64_t numnodes;
+} rax;
+</code></pre>
+<h3 id="raxstack">raxStack</h3>
+<p>raxStack结构用于存储从根节点到当前节点的路径，代码如下。</p>
+<ul>
+<li>stack用于记录路径，该指针可能指向static_items（路径较短时）或者堆空间内存；</li>
+<li>items, maxitems代表stack指向的空间的已用空间以及最大空间；</li>
+<li>static_items是一个数组，数组中的每个元素都是指针，用于存储路径；</li>
+<li>oom代表当前栈是否出现过内存溢出。</li>
+</ul>
+<pre><code class="language-c">#define RAX_STACK_STATIC_ITEMS 32
+typedef struct raxStack {
+    void ＊＊stack;
+    size_t items, maxitems;
+    void ＊static_items[RAX_STACK_STATIC_ITEMS];
+    int oom;
+} raxStack;
+</code></pre>
+<h3 id="raxiterator">raxIterator</h3>
+<p>raxIterator用于遍历Rax树中所有的key，代码如下。集合注释，每个字段很好理解。</p>
+<pre><code class="language-c">typedef struct raxIterator {
+    int flags;
+    rax ＊rt;                    /＊ Radix tree we are iterating. ＊/
+    unsigned char ＊key;          /＊ The current string. ＊/
+    void ＊data;                  /＊ Data associated to this key. ＊/
+    size_t key_len;               /＊ Current key length. ＊/
+    size_t key_max;               /＊ Max key len the current key buffer can hold. ＊/
+    unsigned char key_static_string[RAX_ITER_STATIC_LEN];
+    raxNode ＊node;                /＊ Current node. Only for unsafe iteration. ＊/
+    raxStack stack;                /＊ Stack used for unsafe iteration. ＊/
+    raxNodeCallback node_cb;       /＊Optional node callback. Normally set to NULL.＊/
+} raxIterator;
+</code></pre>
+<h2 id="rax初始化">rax初始化</h2>
+<p>比较简单，代码如下。分配空间，然后进行初始化。此时rax中没有字符串，有一个头节点。如果分配内存失败则返回NULL。</p>
+<pre><code class="language-c">rax *raxNew(void) {
+    rax *rax = rax_malloc(sizeof(*rax));
+    if (rax == NULL) return NULL;
+    rax-&gt;numele = 0;
+    rax-&gt;numnodes = 1;
+    rax-&gt;head = raxNewNode(0,0);
+    if (rax-&gt;head == NULL) {
+        rax_free(rax);
+        return NULL;
+    } else {
+        return rax;
+    }
+}
+</code></pre>
+<p>上面调用的raxNewNode函数用来创建一个新的节点，有两个参数，分别代表子结点个数以及是否有数据。该函数在创建节点时会按照子节点个数以及是否有value指针计算节点所需空间并申请。代码如下。</p>
+<pre><code class="language-c">raxNode *raxNewNode(size_t children, int datafield) {
+    size_t nodesize = sizeof(raxNode)+children+raxPadding(children)+
+                      sizeof(raxNode*)*children;
+    if (datafield) nodesize += sizeof(void*);
+    raxNode *node = rax_malloc(nodesize);
+    if (node == NULL) return NULL;
+    node-&gt;iskey = 0;
+    node-&gt;isnull = 0;
+    node-&gt;iscompr = 0;
+    node-&gt;size = children;
+    return node;
+}
+</code></pre>
+<h2 id="rax插入">rax插入</h2>
+<p>rax提供给外部的有两个插入相关函数——raxInsert和raxTryInsert，但其实两者都只是直接调用了另一个函数——raxGenericInsert，函数声明如下，其中rax指向插入的rax树，s指向key也就是待插入的字符串，len为字符串的长度，data是key对应的value，old是已有的元素，overwrite为1表示如果key已存在则覆盖value，为0则表示不覆盖。</p>
+<pre><code class="language-c">int raxGenericInsert(rax *rax, unsigned char *s, size_t len, void *data, void **old, int overwrite)
+</code></pre>
+<p>由于该函数很复杂，这里分段说明。</p>
+<p>首先是在rax中游走，看能否找到key。raxLowWalk会在树中进行查找，并记录已经查找的字符串长度，并返回为i。</p>
+<pre><code class="language-c">size_t i;
+int j = 0; 
+raxNode *h, **parentlink;
+
+debugf(&quot;### Insert %.*s with value %p\n&quot;, (int)len, s, data);
+i = raxLowWalk(rax,s,len,&amp;h,&amp;parentlink,&amp;j,NULL);
+</code></pre>
+<p>然后是判断，如果i<mark>len说明在rax存在一条路径可以组成需要插入的key，并且j</mark>0，说明查找时最终没有在一个压缩节点的字符串的中间结束。满足上面两个条件则说明要么这个key已经插入了，要么已经有个节点表示这个key只是还不是一个key节点。这种情况下只需要覆盖key节点的value指针或者再给非key节点重新分配一个value指针并设置value即可。</p>
+<pre><code class="language-c">if (i == len &amp;&amp; (!h-&gt;iscompr || j == 0 /* not in the middle if j is 0 */)) {
+    debugf(&quot;### Insert: node representing key exists\n&quot;);
+    /* Make space for the value pointer if needed. */
+    if (!h-&gt;iskey || (h-&gt;isnull &amp;&amp; overwrite)) {
+        h = raxReallocForData(h,data);
+        if (h) memcpy(parentlink,&amp;h,sizeof(h));
+    }
+    if (h == NULL) {
+        errno = ENOMEM;
+        return 0;
+    }
+
+    /* Update the existing key if there is already one. */
+    if (h-&gt;iskey) {
+        if (old) *old = raxGetData(h);
+        if (overwrite) raxSetData(h,data);
+        errno = 0;
+        return 0; /* Element already exists. */
+    }
+
+    /* Otherwise set the node as a key. Note that raxSetData()
+     * will set h-&gt;iskey. */
+    raxSetData(h,data);
+    rax-&gt;numele++;
+    return 1; /* Element inserted. */
+}
+</code></pre>
+<p>剩余的情况大致可以分为两大类（在源码注释中分为5小类，但是对前四种的处理方式一致，所以两种处理方式）。一种是插入的key是一个压缩节点的一部分（应该是前缀），则将压缩节点拆开后直接设置新的key-value即可。第二大类比较麻烦，即待插入的key在某一个位置的字符和当前压缩节点的字符串相应位置的字符不相同，则需要在拆分后的相应位置的非压缩节点中插入新key的相应不匹配的字符，之后将新key的剩余部分插入到这个非压缩节点的子节点中。</p>
+<p>如果查找key完成后，不匹配节点为某个非压缩节点，或者某个压缩节点的某个字符不匹配，进行节点拆分后导致的不匹配位置为拆分后创建的非压缩节点，此时仅仅需要将当前待匹配字符插入到这个非压缩节点上），并为其创建子节点。之后，将剩余字符放入新建的子节点中即可（如果字符长度过长，需要进行分割）。</p>
+<p>那么对于插入key的逻辑就分析到这里，因为这部分的实现的代码太长，这里就不展示了。</p>
+<h2 id="rax查找元素">rax查找元素</h2>
+<p>由raxFind函数实现，不过该函数的逻辑很简单，主要核心是和上面插入元素一样的raxLowWalk函数，这里对该函数进行详细介绍。</p>
+<p>首先看函数声明，rax是查找的rax；s指向key的内容；len是key的长度；stopnode是作为查找的最终节点返回的，但是也有可能没有找到符合的key；plink用于记录父节点中指向*stopnode的指针的位置，当*stopnode变化时，也需要修改父节点指向该节点的指针；当ts不为空时，会将查找该key的路径写入该变量。</p>
+<p>这个函数返回rax中能和key匹配的最长前缀的长度。当返回的值和len不等，则意味着rax中没有这个key。当返回的值和len相等的时候，还要检查stopnode是否为key以及是否为压缩节点。</p>
+<pre><code class="language-c">static inline size_t raxLowWalk(rax *rax, unsigned char *s, size_t len, raxNode **stopnode, raxNode ***plink, int *splitpos, raxStack *ts)
+</code></pre>
+<p>下面是代码分析。首先是变量初始化，然后开始查找。对于压缩节点，需要完全匹配该节点的字符串，否则查找失败。对于非压缩节点，挨个看有没有和当前key中的字符相同的字符，如果没有，查找失败。查找成功后，会保存到当前节点的路径，并设置一些返回值。</p>
+<pre><code class="language-c">raxNode *h = rax-&gt;head;
+raxNode **parentlink = &amp;rax-&gt;head;
+
+size_t i = 0; /* Position in the string. */
+size_t j = 0; /* Position in the node children (or bytes if compressed).*/
+while(h-&gt;size &amp;&amp; i &lt; len) {
+    debugnode(&quot;Lookup current node&quot;,h);
+    unsigned char *v = h-&gt;data;
+
+    if (h-&gt;iscompr) {
+        // 查找压缩节点，需要完全匹配，或者压缩节点只有key的一部分
+        for (j = 0; j &lt; h-&gt;size &amp;&amp; i &lt; len; j++, i++) {
+            if (v[j] != s[i]) break;
+        }
+        if (j != h-&gt;size) break;
+    } else {
+        // 查找非压缩节点，需要和每个字符进行比较
+        for (j = 0; j &lt; h-&gt;size; j++) {
+            if (v[j] == s[i]) break;
+        }
+        if (j == h-&gt;size) break;
+        i++;
+    }
+
+    if (ts) raxStackPush(ts,h); /* Save stack of parent nodes. 即保存路径 */
+    raxNode **children = raxNodeFirstChildPtr(h);
+    if (h-&gt;iscompr) j = 0; /* Compressed node only child is at index 0. */
+    memcpy(&amp;h,children+j,sizeof(h));
+    parentlink = children+j;
+    j = 0;
+}
+debugnode(&quot;Lookup stop node is&quot;,h);
+// 设置返回值 
+if (stopnode) *stopnode = h;
+if (plink) *plink = parentlink;
+if (splitpos &amp;&amp; h-&gt;iscompr) *splitpos = j;
+return i;
+</code></pre>
+<h2 id="rax删除元素">rax删除元素</h2>
+<p>由raxRemove函数实现，如果成功找到元素并删除，返回1，否则返回0。</p>
+<p>首先还是调用raxLowWalk函数查找元素，如果没找到直接返回0，否则继续进行删除操作，具体删除操作的逻辑这里不再介绍，只需要知道由于删除节点可能需要对rax再次进行压缩即可。压缩的情况大致有两种：</p>
+<ul>
+<li>某节点只有一个子节点，该子节点之前是一个key，被删除后不再是key，可以将该节点和子节点压缩为一个节点。</li>
+<li>某个节点有两个子节点，经过删除操作后，只剩下一个子节点，如果这个子节点不是key，则可以将该节点与这个子节点压缩。</li>
+</ul>
+<p>压缩过程可以分为两步：</p>
+<ul>
+<li>找到可以进行压缩的第一个元素，之后将所有可进行压缩的节点进行压缩。</li>
+<li>找到第一个可压缩节点后，进行数据压缩。由于可压缩的节点都只有一个子节点，压缩过程只需要读取每个节点的内容，创建新的节点，并填充新节点的内容即可。</li>
+</ul>
+<h2 id="rax遍历">rax遍历</h2>
+<p>rax同样提供了迭代器遍历整个rax中的元素，相关函数声明如下，并选择性进行说明：</p>
+<ul>
+<li>raxStart：初始化raxIterator结构</li>
+<li>raxSeek：初始化迭代器的位置</li>
+<li>raxRandomWalk：从当前位置开始随机游走，步数为steps，如果为steps为0，则采用1-元素个数的对数*2区间内的一个随机数。</li>
+<li>raxCompare：根据指定的操作符，将迭代器当前指向的键与指定的键进行比较。如果比较为真，返回1，否则返回0。</li>
+<li>raxStop：用于结束迭代并释放相关资源</li>
+<li>raxEOF：用于标识迭代器迭代结束</li>
+</ul>
+<pre><code class="language-c">void raxStart(raxIterator *it, rax *rt);
+int raxSeek(raxIterator *it, const char *op, unsigned char *ele, size_t len);
+int raxNext(raxIterator *it);
+int raxPrev(raxIterator *it);
+int raxRandomWalk(raxIterator *it, size_t steps);
+int raxCompare(raxIterator *iter, const char *op, unsigned char *key, size_t key_len);
+void raxStop(raxIterator *it);
+int raxEOF(raxIterator *it);
+</code></pre>
+<p>这里不再针对某些函数详细介绍，但是提一下遍历的特性。这些特性也是由rax的结构体决定的。</p>
+<ul>
+<li>如果某个节点为key，则其子节点的key按照字典序比该节点的key大。</li>
+<li>如果当前节点为非压缩节点，则其最左侧节点的key是其所有子节点的key中最小的。</li>
+</ul>
+<h2 id="参考">参考</h2>
+<p><a href="https://juejin.cn/post/7093897325415923719">深入分析redis之rax底层原理，前缀树？ - 掘金 (juejin.cn)</a></p>
+<p>《Redis5 设计与源码分析》</p>
+]]></content>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[Redis7.0源码阅读笔记——quicklist]]></title>
+        <id>https://zch273711.github.io/post/source_code_redis7.0_quicklist/</id>
+        <link href="https://zch273711.github.io/post/source_code_redis7.0_quicklist/">
+        </link>
+        <updated>2023-06-12T12:27:51.000Z</updated>
+        <content type="html"><![CDATA[<p>quicklist是redis提供的六种基本数据结构中List的底层实现，而quicklist的实现又依赖于listpack数据结构。不过值得注意的是，在7.0版本之前，quicklist的底层实现还是依赖于ziplist，在7.0版本换为了listpack结构。</p>
+<p>在quicklist.c文件开头，就对quicklist进行了很精简的概括——quicklist是一个双向链接的listpack链表。</p>
+<h2 id="quicklist结构体">quicklist结构体</h2>
+<h3 id="quicklistnode">quicklistNode</h3>
+<p>首先看quicklist相关的结构体，和quicklist相关的结构体都在quicklist.h文件中。首先是quicklistNode结构体。代表quicklist中的一个节点。字段说明如下：</p>
+<ul>
+<li>prev，指向前一个结点的指针；</li>
+<li>next，指向后一个节点的指针；</li>
+<li>entry，指向一个listpack结构体或quicklistLZF结构体（下面会介绍）；</li>
+<li>sz，entry指向的结构体所占用的空间；</li>
+<li>count，entry指向的listpack中元素的个数；</li>
+<li>encoding，当前节点的编码方式，分为原生和压缩两种，如果是压缩，则entry指向quicklistLZF结构体；</li>
+</ul>
+<p>其他字段看注释了解即可。</p>
+<pre><code class="language-c">typedef struct quicklistNode {
+    struct quicklistNode *prev;
+    struct quicklistNode *next;
+    unsigned char *entry;
+    size_t sz;             /* entry size in bytes */
+    unsigned int count : 16;     /* count of items in listpack */
+    unsigned int encoding : 2;   /* RAW==1 or LZF==2 */
+    unsigned int container : 2;  /* PLAIN==1 or PACKED==2 */
+    unsigned int recompress : 1; /* was this node previous compressed? */
+    unsigned int attempted_compress : 1; /* node can't compress; too small */
+    unsigned int dont_compress : 1; /* prevent compression of entry that will be used later */
+    unsigned int extra : 9; /* more bits to steal for future usage */
+} quicklistNode;
+</code></pre>
+<h3 id="quicklistlzf">quicklistLZF</h3>
+<p>代码如下。为了在listpack的基础上再提升内存空间的使用效率，于是采用LZF算法对quicklist中间节点进行压缩。sz表示后面被压缩内容的字节空间，后面compressed存储被压缩的数据。</p>
+<pre><code class="language-c">typedef struct quicklistLZF {
+    size_t sz; /* LZF size in bytes*/
+    char compressed[];
+} quicklistLZF;
+</code></pre>
+<h3 id="quicklist">quicklist</h3>
+<p>代表整个quicklist，代码如下。对其中几个字段进行说明。fill如果是正数，表示链表中每个节点listpack中允许的最大元素个数，如果是负数，表示listpack的最大空间；compress代表两端各有compress个节点不会进行压缩；</p>
+<pre><code class="language-c">typedef struct quicklist {
+    quicklistNode *head;
+    quicklistNode *tail;
+    unsigned long count;        /* total count of all entries in all listpacks */
+    unsigned long len;          /* number of quicklistNodes */
+    signed int fill : QL_FILL_BITS;       /* fill factor for individual nodes */
+    unsigned int compress : QL_COMP_BITS; /* depth of end nodes not to compress;0=off */
+    unsigned int bookmark_count: QL_BM_BITS;
+    quicklistBookmark bookmarks[];
+} quicklist;
+</code></pre>
+<h3 id="quicklistentry">quicklistEntry</h3>
+<p>为了方便使用listpack中的元素，提供的一个结构体，代码如下。quicklist指向当前元素所在的quicklist; node指向当前元素所在的quicklistNode结构；zi指向当前元素所在的listpack;value指向该节点的字符串内容；longval为该节点的整型值；sz代表该节点的大小，与value配合使用；offset表明该节点相对于整个listpack的偏移量，即该节点是listpack第多少个entry。</p>
+<pre><code class="language-c">typedef struct quicklistEntry {
+    const quicklist *quicklist;
+    quicklistNode *node;
+    unsigned char *zi;
+    unsigned char *value;
+    long long longval;
+    size_t sz;
+    int offset;
+} quicklistEntry;
+</code></pre>
+<p>有关quicklist的压缩算法就不再深入分析，如果需要可以单独了解LZF压缩算法。</p>
+<h2 id="quicklist的创建">quicklist的创建</h2>
+<p>比较简单，直接上代码。分配空间然后给各个字段初始化即可。</p>
+<pre><code class="language-c">quicklist *quicklistCreate(void) {
+    struct quicklist *quicklist;
+
+    quicklist = zmalloc(sizeof(*quicklist));
+    quicklist-&gt;head = quicklist-&gt;tail = NULL;
+    quicklist-&gt;len = 0;
+    quicklist-&gt;count = 0;
+    quicklist-&gt;compress = 0;
+    quicklist-&gt;fill = -2;
+    quicklist-&gt;bookmark_count = 0;
+    return quicklist;
+}
+</code></pre>
+<p>除了创建新的quicklist，还可以通过quicklistNew自定义fill和compress字段创建。</p>
+<pre><code class="language-c">quicklist *quicklistNew(int fill, int compress) {
+    quicklist *quicklist = quicklistCreate();
+    quicklistSetOptions(quicklist, fill, compress);
+    return quicklist;
+}
+</code></pre>
+<p>除了创建操作，还提供了一些函数可以设置quicklist的一些字段，这些函数声明如下</p>
+<pre><code class="language-c">void quicklistSetCompressDepth(quicklist *quicklist, int depth);
+void quicklistSetFill(quicklist *quicklist, int fill);
+void quicklistSetOptions(quicklist *quicklist, int fill, int depth);
+</code></pre>
+<h2 id="quicklist添加元素">quicklist添加元素</h2>
+<p>添加元素主要是由quicklistPushHead和quicklistPushTail函数完成的。不过两者的逻辑和步骤都差不多，所以看quicklistPushHead就行了，代码如下。value指向添加的元素，sz是添加源的长度。如果再添加元素的过程中增加了节点，则返回1，否则返回0。其中unlikely和likely是两个宏定义，由__builtin_expect内建函数实现，用来进行分支预测和优化，这里不详细介绍。</p>
+<p>总的来说，这函数会先判断节点是否允许继续插入，如果允许则直接调用listpack的函数添加元素，否则需要创建新的节点，并进行添加元素。需要注意的是，新建的节点都是默认未压缩的。最后函数会更新count和len。</p>
+<pre><code class="language-c">int quicklistPushHead(quicklist *quicklist, void *value, size_t sz) {
+    quicklistNode *orig_head = quicklist-&gt;head;
+
+    if (unlikely(isLargeElement(sz))) {
+        __quicklistInsertPlainNode(quicklist, quicklist-&gt;head, value, sz, 0);
+        return 1;
+    }
+
+    if (likely(
+            _quicklistNodeAllowInsert(quicklist-&gt;head, quicklist-&gt;fill, sz))) {
+        quicklist-&gt;head-&gt;entry = lpPrepend(quicklist-&gt;head-&gt;entry, value, sz);
+        quicklistNodeUpdateSz(quicklist-&gt;head);
+    } else {
+        quicklistNode *node = quicklistCreateNode();
+        node-&gt;entry = lpPrepend(lpNew(0), value, sz);
+
+        quicklistNodeUpdateSz(node);
+        _quicklistInsertNodeBefore(quicklist, quicklist-&gt;head, node);
+    }
+    quicklist-&gt;count++;
+    quicklist-&gt;head-&gt;count++;
+    return (orig_head != quicklist-&gt;head);
+}
+</code></pre>
+<p>上面使用到的_quicklistInsertNodeBefore函数是在特定节点之前插入新的节点，该函数的实现直接调用了__quicklistInsertNode函数。</p>
+<h2 id="quicklist删除元素">quicklist删除元素</h2>
+<p>由quicklistDelEntry实现，代码如下。删除的行为直接由quicklistDelIndex函数实现，然后由迭代器的方向决定当前元素的更新。quicklistDelIndex函数如果删除了整个Node则返回1，如果当前元素被删除了但是Node依然存在，则返回0。</p>
+<pre><code class="language-c">void quicklistDelEntry(quicklistIter *iter, quicklistEntry *entry) {
+    quicklistNode *prev = entry-&gt;node-&gt;prev;
+    quicklistNode *next = entry-&gt;node-&gt;next;
+    int deleted_node = quicklistDelIndex((quicklist *)entry-&gt;quicklist,
+                                         entry-&gt;node, &amp;entry-&gt;zi);
+
+    /* after delete, the zi is now invalid for any future usage. */
+    iter-&gt;zi = NULL;
+
+    /* If current node is deleted, we must update iterator node and offset. */
+    if (deleted_node) {
+        if (iter-&gt;direction == AL_START_HEAD) {
+            iter-&gt;current = next;
+            iter-&gt;offset = 0;
+        } else if (iter-&gt;direction == AL_START_TAIL) {
+            iter-&gt;current = prev;
+            iter-&gt;offset = -1;
+        }
+    }
+}
+</code></pre>
+<p>除了使用上面的函数进行指定位置删除，还可以使用quicklistPop函数直接弹出头或尾部元素。除此之外，还有quicklistDelRange函数可以一次性删除多个元素。</p>
+<h2 id="quicklist更改元素">quicklist更改元素</h2>
+<p>由quicklistReplaceAtIndex函数完成，代码如下。首先创建一个迭代器，然后调用quicklistReplaceEntry函数完成替换，最后释放迭代器。如果更改元素完成，则返回1，否则返回0。</p>
+<pre><code class="language-c">int quicklistReplaceAtIndex(quicklist *quicklist, long index, void *data,
+                            size_t sz) {
+    quicklistEntry entry;
+    quicklistIter *iter = quicklistGetIteratorEntryAtIdx(quicklist, index, &amp;entry);
+    if (likely(iter)) {
+        quicklistReplaceEntry(iter, &amp;entry, data, sz);
+        quicklistReleaseIterator(iter);
+        return 1;
+    } else {
+        return 0;
+    }
+}
+</code></pre>
+<h2 id="quicklist获取元素">quicklist获取元素</h2>
+<p>目前在quicklist提供的API中，主要是通过迭代器来获取元素。首先，可以在特定位置创建一个迭代器，并指定遍历的方向。后面就可以通过quicklistNext函数依次获取元素。</p>
+]]></content>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[Redis7.0源码阅读笔记——listpack]]></title>
+        <id>https://zch273711.github.io/post/source_code_redis7.0_listpack/</id>
+        <link href="https://zch273711.github.io/post/source_code_redis7.0_listpack/">
+        </link>
+        <updated>2023-06-12T04:02:11.000Z</updated>
+        <content type="html"><![CDATA[<p>listpack在redis7.0中也是一种底层的数据结构，quiklist的实现、stream的实现以及redis向外提供的六种数据结构之一的hash也需要依赖listpack的实现。这一文章将对listpack进行分析。</p>
+<h2 id="listpack的结构">listpack的结构</h2>
+<p>首先介绍listpack的结构，具体为什么会在后面小节中解释。</p>
+<p>listpack首先由两个字段，4个字节的占用空间（以字节为单位），2个字节的总的元素个数。接着这两个字段便是一个个接着的具体数据元素（entry）。最后有一个额外的字节恒为0xFF标志listpack的结束。（原因参照listpack创建过程）</p>
+<p>具体数据（entry）也可以分为三个部分。</p>
+<ul>
+<li>首先是encoding，表示数据的编码，占用2字节。可用的编码类型有（参见listpack.c文件开头宏定义部分）：
+<ul>
+<li>7bit无符号数。0xxx xxxx，后7位存储数据。</li>
+<li>6bit长的字符串。10LL LLLL，后六位记录字符串的长度，接着后面是数据。</li>
+<li>13bit有符号整数。110x xxxx，后5位以及后面一个byte存储数据。</li>
+<li>12bit长字符串。1110 LLLL，后四位以及下一个byte记录字符串的长度，紧接着后面是字符串数据。</li>
+<li>16bit有符号整数。1111 0001，后面两个字节为数据。</li>
+<li>24bit整数。1111 0010，后三个字节为数据。</li>
+<li>32bit整数。1111 0011，后四个字节为数据。</li>
+<li>64bit整数。1111 0100，后8个字节为数据。</li>
+<li>32bit长度字符串。1111 0000，后四个字节记录字符串的长度，然后紧接着字符串内容。</li>
+</ul>
+</li>
+<li>数据，具体说明在encoding部分。</li>
+<li>backlen，记录本entry的长度，至多占用5 byte，即该字段的空间不固定。实际每个字节只有低7为记录长度，最高位为0表示后面一个字节还是backlen字段部分，如果最高位为1则表示后面是下一个entry或者整个listpack的结束。举个例子，一个两字节的backlen，二进制存储为0000 0001 1000 1000，则实际长度为000 0001 000 1000，一共14为，转换为10进制为136字节。</li>
+</ul>
+<h2 id="listpack的创建">listpack的创建</h2>
+<p>代码如下，首先是分配空间。会判断指定的capacity和LP_HDR_SIZE+1的大小再进行分配空间，也就是说分配给listpack的空间最小为LP_HDR_SIZE+1。为什么呢？首先看LP_HDR_SIZE的大小，通过宏定义为6，所以listpack最小为7。再通过后面的初始化操作看一下为什么。</p>
+<p>在分配好空间过后，会设置三个字段的值，首先看lpSetTotalBytes，这是一个宏定义，该宏定义也在下方代码中。理解后可以知道，该宏定义就是在设置listpack总的字节长度，也就是说listpack的前四个字节就是记录的listpack的总长度。接着第二个宏定义，lpSetNumElements，该宏定义就是在设置listpack中的entry个数，位于listpack开始的第5、6个字节。最后，会将lp第7个字节设置为LP_EOF，该值为0xFF，即标志listpack的最后一位。而所有插入的entry都会在第6字节后，最后一个标志位之前。这就是listpack的整体结构。</p>
+<pre><code class="language-c">unsigned char *lpNew(size_t capacity) {
+    unsigned char *lp = lp_malloc(capacity &gt; LP_HDR_SIZE+1 ? capacity : LP_HDR_SIZE+1);
+    if (lp == NULL) return NULL;
+    lpSetTotalBytes(lp,LP_HDR_SIZE+1);
+    lpSetNumElements(lp,0);
+    lp[LP_HDR_SIZE] = LP_EOF;
+    return lp;
+}
+
+#define lpSetTotalBytes(p,v) do { \
+    (p)[0] = (v)&amp;0xff; \
+    (p)[1] = ((v)&gt;&gt;8)&amp;0xff; \
+    (p)[2] = ((v)&gt;&gt;16)&amp;0xff; \
+    (p)[3] = ((v)&gt;&gt;24)&amp;0xff; \
+} while(0)
+
+#define lpSetNumElements(p,v) do { \
+    (p)[4] = (v)&amp;0xff; \
+    (p)[5] = ((v)&gt;&gt;8)&amp;0xff; \
+} while(0)
+</code></pre>
+<h2 id="listpack的插入操作">listpack的插入操作</h2>
+<p>前面说过，listpack中可以存储字符串和整数类型的数据，所以listpack也提供了两个插入相关的函数，分别用于整数和字符串的插入，函数声明如下：</p>
+<pre><code class="language-c">unsigned char *lpInsertString(unsigned char *lp, unsigned char *s, uint32_t slen,
+                              unsigned char *p, int where, unsigned char **newp);
+unsigned char *lpInsertInteger(unsigned char *lp, long long lval,
+                               unsigned char *p, int where, unsigned char **newp);
+</code></pre>
+<p>但是这两个函数的源码很简单，因为都是另外一个函数——lpInsert函数的修饰函数，所以插入的主要逻辑存在于lpInsert函数中。lpInsert函数不仅可以用来在特定位置增加元素，还可以用来删除元素。该函数比较长，而且有很详细的注释，这里首先通过注释了解该函数的功能和实现。函数的声明如下所示。</p>
+<pre><code class="language-c">unsigned char *lpInsert(unsigned char *lp, unsigned char *elestr, unsigned char *eleint,
+                        uint32_t size, unsigned char *p, int where, unsigned char **newp)
+</code></pre>
+<p>lp为操作的listpack；elestr是字符串数据；eleint是整数数据；size当elestr不为空时，指定字符串的长度；p指向要修改的位置；where表示在p位置前面、后面插入还是替换当前元素；如果elestr和eleint都为NULL，则直接移除当前位置元素。如果newp不为NULL，则设置为新增加元素的指针，并且对于所有的删除操作，newp会被设置为被删除元素后面第一个元素。</p>
+<p>下面简单看一下lpInsert源码，首先是准备部分。通过elestr和eleint都为NULL判断是否是删除操作。如果是删除操作则将where设置为replace。然后判断是否在当前元素后面插入，如果是，直接转移到下一个元素并进行前向插入操作。也就是说本函数实际上只处理在前面插入和替换操作。</p>
+<pre><code class="language-c">unsigned char intenc[LP_MAX_INT_ENCODING_LEN];
+unsigned char backlen[LP_MAX_BACKLEN_SIZE];
+
+uint64_t enclen; /* The length of the encoded element. */
+int delete = (elestr == NULL &amp;&amp; eleint == NULL);
+
+if (delete) where = LP_REPLACE;
+
+if (where == LP_AFTER) {
+    p = lpSkip(p);
+    where = LP_BEFORE;
+    ASSERT_INTEGRITY(lp, p);
+}
+</code></pre>
+<p>然后是编码部分，首先，如果传入的是字符串，则调用lpEncodeGetType函数尝试编码为整数类型。如果字符串可以编码为整数类型，则intenc中会存储将字符串转换为整数的内容，enclen表示编码的长度。</p>
+<pre><code class="language-c">int enctype;
+if (elestr) {
+    enctype = lpEncodeGetType(elestr,size,intenc,&amp;enclen);
+    if (enctype == LP_ENCODING_INT) eleint = intenc;
+} else if (eleint) {
+    enctype = LP_ENCODING_INT;
+    enclen = size; /* 'size' is the length of the encoded integer element. */
+} else {
+    enctype = -1;
+    enclen = 0;
+}
+</code></pre>
+<p>下一步是计算修改后listpack所需的空间。</p>
+<pre><code class="language-c">unsigned long backlen_size = (!delete) ? lpEncodeBacklen(backlen,enclen) : 0;
+uint64_t old_listpack_bytes = lpGetTotalBytes(lp);
+uint32_t replaced_len  = 0;
+if (where == LP_REPLACE) {
+    replaced_len = lpCurrentEncodedSizeUnsafe(p);
+    replaced_len += lpEncodeBacklen(NULL,replaced_len);
+    ASSERT_INTEGRITY_LEN(lp, p, replaced_len);
+}
+
+uint64_t new_listpack_bytes = old_listpack_bytes + enclen + backlen_size
+                              - replaced_len;
+if (new_listpack_bytes &gt; UINT32_MAX) return NULL;
+</code></pre>
+<p>然后是重新分配空间。</p>
+<pre><code class="language-c">unsigned char *dst = lp + poff; /* May be updated after reallocation. */
+
+/* Realloc before: we need more room. */
+if (new_listpack_bytes &gt; old_listpack_bytes &amp;&amp;
+    new_listpack_bytes &gt; lp_malloc_size(lp)) {
+    if ((lp = lp_realloc(lp,new_listpack_bytes)) == NULL) return NULL;
+    dst = lp + poff;
+}
+
+/* Setup the listpack relocating the elements to make the exact room
+ * we need to store the new one. */
+if (where == LP_BEFORE) {
+    memmove(dst+enclen+backlen_size,dst,old_listpack_bytes-poff);
+} else { /* LP_REPLACE. */
+    long lendiff = (enclen+backlen_size)-replaced_len;
+    memmove(dst+replaced_len+lendiff,
+            dst+replaced_len,
+            old_listpack_bytes-poff-replaced_len);
+}
+
+/* Realloc after: we need to free space. */
+if (new_listpack_bytes &lt; old_listpack_bytes) {
+    if ((lp = lp_realloc(lp,new_listpack_bytes)) == NULL) return NULL;
+    dst = lp + poff;
+}
+</code></pre>
+<p>最后就是将元素插入并且更新listpack的其他字段，这里源码没有展示。</p>
+<h2 id="listpack整数的插入">listpack整数的插入</h2>
+<p>listpack对于整数的处理有一点指的介绍。在listpack中所有整数都是以非负的形式存储的。例如，如果想要存储一个16位有符号整数，则会以16位无符号数的形式存储，对于16位有符号整数的负数，会以16位无符号整数的较大范围存储。举个例子，对于一个16位有符号整数，范围为-32768 — 32767，如果存储0—32767会直接存储，对于-32768 — -1，会加上2^16，将相加的结果存储。这一点可以在listpack.c中的lpEncodeIntegerGetType函数得知。</p>
+<h2 id="listpack的获取">listpack的获取</h2>
+<p>通过lpGet函数，可以获取listpack中指定位置的元素的值。函数声明如下。其实该函数的实现只是调用了一个更底层的函数lpGetWithSize，所以这里介绍一下lpGet函数的功能。</p>
+<p>lpGet用于获取p指向的listpack中存储的元素：当元素采用字符串编码时，返回字符串的第一个元素位置，count为元素个数；当采用整型编码时，若intbuf不为空，则将整型数据转换为字符串存储在intbuf中，count为元素个数，并返回intbuf。若intbuf为空，直接将数据存储在count中，返回null。</p>
+<pre><code class="language-c">unsigned char *lpGet(unsigned char *p, int64_t *count, unsigned char *intbuf)
+</code></pre>
+<p>而lpGetWithSize函数的实现步骤上也比较简单，主要是需要判断不同类型的编码，然后采用相应的解码方式。但是除了可以获取元素内容之外，还可以给一个额外参数给lpGetWithSize函数，一个指针，若该参数不为NULL，则会返回listpack中该位置元素的字节长度。</p>
+<h2 id="listpack的其他接口">listpack的其他接口</h2>
+<h3 id="遍历">遍历</h3>
+<p>listpack还提供了一些函数方便对listpack进行遍历，函数声明如下：</p>
+<pre><code class="language-c">unsigned char *lpFirst(unsigned char *lp);
+unsigned char *lpLast(unsigned char *lp);
+unsigned char *lpNext(unsigned char *lp, unsigned char *p);
+unsigned char *lpPrev(unsigned char *lp, unsigned char *p);
+</code></pre>
+<h3 id="修改">修改</h3>
+<p>除了插入操作，还提供了replace、delete、append等相应操作的函数，但是基本都是依靠lpInsert函数实现的，所以理解了lpInsert函数即可。</p>
+<pre><code class="language-c">unsigned char *lpPrepend(unsigned char *lp, unsigned char *s, uint32_t slen);
+unsigned char *lpPrependInteger(unsigned char *lp, long long lval);
+unsigned char *lpAppend(unsigned char *lp, unsigned char *s, uint32_t slen);
+unsigned char *lpAppendInteger(unsigned char *lp, long long lval);
+unsigned char *lpReplace(unsigned char *lp, unsigned char **p, unsigned char *s, uint32_t slen);
+unsigned char *lpReplaceInteger(unsigned char *lp, unsigned char **p, long long lval);
+unsigned char *lpDelete(unsigned char *lp, unsigned char *p, unsigned char **newp);
+unsigned char *lpDeleteRangeWithEntry(unsigned char *lp, unsigned char **p, unsigned long num);
+unsigned char *lpDeleteRange(unsigned char *lp, long index, unsigned long num);
+</code></pre>
+<p>listpack源码就先看到这里。</p>
+]]></content>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[Redis7.0源码阅读笔记——intset]]></title>
+        <id>https://zch273711.github.io/post/source_code_redis7.0_intset/</id>
+        <link href="https://zch273711.github.io/post/source_code_redis7.0_intset/">
+        </link>
+        <updated>2023-06-07T12:42:36.000Z</updated>
+        <content type="html"><![CDATA[<p>intset，即整数集合，是redis集合类型的底层实现之一。当redis集合类型中所有元素都为整数，并且都能够以64位以内位数进行表示的话，集合就会采用intset进行数据存储管理，并且intset中的所有整数都是从小到大排列。</p>
+<p>intset相关的实现都在intset.c和intset.h两个文件中。先看一下intset的结构体。一共三个字段，第一个字段是说明数据采用什么形式存储的，一共有三种可能的格式，16、32、64位存储，也就是2、4、8字节，定义在intset.c文件中。第二个字段是集合中整数的个数。第三个字段是一个柔性数组，都是8位的，通过encoding字段判断一个整数占几个字节。</p>
+<pre><code class="language-c">typedef struct intset {
+    uint32_t encoding;
+    uint32_t length;
+    int8_t contents[];
+} intset;
+</code></pre>
+<p>intset的创建操作比较简单，申请内存、初始化encoding位16，length=0。</p>
+<h2 id="intset的增加操作">intset的增加操作</h2>
+<p>代码如下。首先通过_intsetValueEncoding函数得到value对应的类型（16、32、64位）。如果value的类型比encoding大，则需要把intset中所有元素都扩展为相应的位数，故调用intsetUpgradeAndAdd函数扩展所有数的位数，并插入元素。否则，先查找是否已经存在于intset，如果存在，则直接返回，如果不存在，则也通过intsetSearch函数获取了应该插入的位置，并resize整数集合，保证插入空间足够。resize过后，通过intsetMoveTail函数将应该插入位置及以后的元素都向后移动一位。</p>
+<p>最后就是调用_intsetSet函数插入元素，并将intset的length加一。</p>
+<pre><code class="language-c">intset *intsetAdd(intset *is, int64_t value, uint8_t *success) {
+    uint8_t valenc = _intsetValueEncoding(value);
+    uint32_t pos;
+    if (success) *success = 1;
+
+    if (valenc &gt; intrev32ifbe(is-&gt;encoding)) {
+        /* This always succeeds, so we don't need to curry *success. */
+        return intsetUpgradeAndAdd(is,value);
+    } else {
+        if (intsetSearch(is,value,&amp;pos)) {
+            if (success) *success = 0;
+            return is;
+        }
+
+        is = intsetResize(is,intrev32ifbe(is-&gt;length)+1);
+        if (pos &lt; intrev32ifbe(is-&gt;length)) intsetMoveTail(is,pos,pos+1);
+    }
+
+    _intsetSet(is,pos,value);
+    is-&gt;length = intrev32ifbe(intrev32ifbe(is-&gt;length)+1);
+    return is;
+}
+</code></pre>
+<p>这里顺便介绍一下intsetSearch函数，该函数是在intset中查找给定的值，若存在intset中则返回1，否则返回0，并通过一个指针类型的参数设置该值应该在set中的位置。</p>
+<p>同样，理解了intsetSearch函数，intsetFind函数就简单了，就三行代码，几乎就直接通过intsetSearch函数确定一个值是否存在于intset中。</p>
+<h2 id="intset的删除操作">intset的删除操作</h2>
+<p>逻辑也很简单，先调用intsetSearch函数搜索需要删除的值的位置，如果不存在，则直接返回。如果存在，则调用intsetMoveTail函数将后一个位置以及后面的所有元素都向前移动一位，并将length减一。</p>
+<pre><code class="language-c">intset *intsetRemove(intset *is, int64_t value, int *success) {
+    uint8_t valenc = _intsetValueEncoding(value);
+    uint32_t pos;
+    if (success) *success = 0;
+
+    if (valenc &lt;= intrev32ifbe(is-&gt;encoding) &amp;&amp; intsetSearch(is,value,&amp;pos)) {
+        uint32_t len = intrev32ifbe(is-&gt;length);
+
+        /* We know we can delete */
+        if (success) *success = 1;
+
+        /* Overwrite value with tail and update length */
+        if (pos &lt; (len-1)) intsetMoveTail(is,pos+1,pos);
+        is = intsetResize(is,len-1);
+        is-&gt;length = intrev32ifbe(len-1);
+    }
+    return is;
+}
+</code></pre>
+<p>由于intset数据结构比较简单，所以本次先分析到这里。</p>
+]]></content>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[Redis7.0源码阅读笔记——dict]]></title>
+        <id>https://zch273711.github.io/post/source_code_redis7.0_dict/</id>
+        <link href="https://zch273711.github.io/post/source_code_redis7.0_dict/">
+        </link>
+        <updated>2023-06-07T10:46:04.000Z</updated>
+        <content type="html"><![CDATA[<p>字典在Redis中拥有很重要的地位，因为Redis整个就是一个内存键值对数据库，所以其存储的基本格式都是字典。</p>
+<h2 id="dict结构体定义">dict结构体定义</h2>
+<p>字典相关的实现在dict.h和dict.c文件中，其中字典的结构体定义在dict.h中，代码如下。下面对各个字段进行解释。</p>
+<ul>
+<li>type，指向dictType类型的指针，该类型中声明了很多函数指针，类似于Golang中的非空Interface。由于字典在Redis中的应用很广，需要用到一些额外的特性和功能，所以抽象出来到dictType中，对于不同类型的应用可以进行对应的实现。后面会对该结构体里面的函数的作用做介绍。</li>
+<li>ht_table，两个指向指向dictEntry的指针的指针，其实就是存储的具体的键值对数据，后面对dictEntry结构体做详细介绍。至于为什么会有两个，可能是因为在dict使用的过程中会涉及rehash等操作。</li>
+<li>ht_used，标志两个hash表是否在使用，以及有多少个entry。</li>
+<li>rehashidx，表示是否在rehash阶段，以及rehash的item的index。如果没有在rehash阶段，则为-1。</li>
+<li>pauserehash，表示rehash操作是否被暂停，大于0表示暂停，小于0表示错误。</li>
+<li>ht_size_exp记录两个hash表的大小（以entry为单位），存储的值为大小的2的对数。</li>
+<li>metadata，任意字节数的空间，由dictType中的dictMetadataBytes函数定义大小。注释可能有误，因为在创建dict时确实是调用dictMetadataBytes函数返回的大小。</li>
+</ul>
+<pre><code class="language-c">struct dict {
+    dictType *type;
+
+    dictEntry **ht_table[2];
+    unsigned long ht_used[2];
+
+    long rehashidx; /* rehashing not in progress if rehashidx == -1 */
+
+    /* Keep small vars at end for optimal (minimal) struct padding */
+    int16_t pauserehash; /* If &gt;0 rehashing is paused (&lt;0 indicates coding error) */
+    signed char ht_size_exp[2]; /* exponent of size. (size = 1&lt;&lt;exp) */
+
+    void *metadata[];           /* An arbitrary number of bytes (starting at a
+                                 * pointer-aligned address) of size as defined
+                                 * by dictType's dictEntryBytes. */
+};
+</code></pre>
+<h2 id="dictentry结构体定义">dictEntry结构体定义</h2>
+<p>该定义在dict.c文件中，用来存储一个键值对，代码如下。各个字段的介绍：</p>
+<ul>
+<li>key，指向键的数据。</li>
+<li>v，一个联合体，存放值，不同场景下使用不同类型的值，例如，用字典存储整个redis所有的键值对时，使用的是val字段。在被用来记录键的过期时间时，用的是s64字段。</li>
+<li>next，hash冲突时的链表中的下一个dictEntry。</li>
+<li>metadata，由dictType中的dictEntryMetadataBytes函数定义大小。</li>
+</ul>
+<pre><code class="language-c">struct dictEntry {
+    void *key;
+    union {
+        void *val;
+        uint64_t u64;
+        int64_t s64;
+        double d;
+    } v;
+    struct dictEntry *next;     /* Next entry in the same hash bucket. */
+    void *metadata[];           /* An arbitrary number of bytes (starting at a
+                                 * pointer-aligned address) of size as returned
+                                 * by dictType's dictEntryMetadataBytes(). */
+};
+</code></pre>
+<h2 id="dicttype结构体定义">dictType结构体定义</h2>
+<p>该结构体定义在dict.h文件中，代码如下。前面的几个函数指针都是对键和值的基本操作，例如第一个就是自定义的哈希函数。主要看下面两个属性，当no_value为1，则dict中的entry是没有value的，只有key，即整个dict变成了一个set。同时，dictSetKey函数和dictEntry中的metadata也无法使用。另外，当no_value为1，并且设置keys_are_odd为1时，可以更进一步优化，不用dictEntry进行存储，更加节省空间。这些都是从注释直接了解到的。</p>
+<pre><code class="language-c">typedef struct dictType {
+    uint64_t (*hashFunction)(const void *key);
+    void *(*keyDup)(dict *d, const void *key);
+    void *(*valDup)(dict *d, const void *obj);
+    int (*keyCompare)(dict *d, const void *key1, const void *key2);
+    void (*keyDestructor)(dict *d, void *key);
+    void (*valDestructor)(dict *d, void *obj);
+    int (*expandAllowed)(size_t moreMem, double usedRatio);
+    /* Flags */
+    /* The 'no_value' flag, if set, indicates that values are not used, i.e. the
+     * dict is a set. When this flag is set, it's not possible to access the
+     * value of a dictEntry and it's also impossible to use dictSetKey(). Entry
+     * metadata can also not be used. */
+    unsigned int no_value:1;
+    /* If no_value = 1 and all keys are odd (LSB=1), setting keys_are_odd = 1
+     * enables one more optimization: to store a key without an allocated
+     * dictEntry. */
+    unsigned int keys_are_odd:1;
+    /* TODO: Add a 'keys_are_even' flag and use a similar optimization if that
+     * flag is set. */
+
+    /* Allow each dict and dictEntry to carry extra caller-defined metadata. The
+     * extra memory is initialized to 0 when allocated.
+     * 下面第二个函数在创建dict时会用到，用来计算额外metadata需要的空间。
+     * 第一个函数应该是在创建dictEntry时用到，返回dictEntry中metadata的大小。
+     */
+    size_t (*dictEntryMetadataBytes)(dict *d);
+    size_t (*dictMetadataBytes)(void);
+    /* Optional callback called after an entry has been reallocated (due to
+     * active defrag). Only called if the entry has metadata. */
+    void (*afterReplaceEntry)(dict *d, dictEntry *entry);
+} dictType;
+</code></pre>
+<h2 id="dict的创建操作">dict的创建操作</h2>
+<p>字典的创建操作体现在dictCreate函数中，整体实现比较简单，代码如下。首先会调用dictType中的dictMetadataBytes函数获取dict中metadata的字节数空间，然后分配空间。再调用_dictInit函数进行初始化。可以看见，rehashidx字段为-1，pauserehash字段为0。 _dictReset函数是设置三个和hash表相关的字段，将hash表设置为NULL，大小的2对数设置为-1，hash表使用字段设置为0。</p>
+<pre><code class="language-c">static void _dictReset(dict *d, int htidx)
+{
+    d-&gt;ht_table[htidx] = NULL;
+    d-&gt;ht_size_exp[htidx] = -1;
+    d-&gt;ht_used[htidx] = 0;
+}
+
+/* Create a new hash table */
+dict *dictCreate(dictType *type)
+{
+    size_t metasize = type-&gt;dictMetadataBytes ? type-&gt;dictMetadataBytes() : 0;
+    dict *d = zmalloc(sizeof(*d) + metasize);
+    if (metasize) {
+        memset(dictMetadata(d), 0, metasize);
+    }
+
+    _dictInit(d,type);
+    return d;
+}
+
+/* Initialize the hash table */
+int _dictInit(dict *d, dictType *type)
+{
+    _dictReset(d, 0);
+    _dictReset(d, 1);
+    d-&gt;type = type;
+    d-&gt;rehashidx = -1;
+    d-&gt;pauserehash = 0;
+    return DICT_OK;
+}
+</code></pre>
+<h2 id="dict扩展操作">dict扩展操作</h2>
+<p>和dict的扩展操作相关的函数一共有三个函数，分别是dictExpand、dictTryExpand、_dictExpand三个函数。前两个函数基本都是直接调用第三个函数进行dict的扩展操作。前两者的区别在于，前者是直接调用并返回 _dictExpand函数的结果，而后者会多一个判断是否在 _dictExpand中分配内存出错的参数，作为指针传入 _dictExpand函数。下面对扩展操作进行简要分析。</p>
+<p>首先会判断当前大小是否小于已经使用的大小，是的话直接返回。如果目标size确实更大，则调用_dictNextExp函数获取比size更大的下一个2的整数幂次的数对应的幂次（new_ht_size_exp）。然后做进一步的判断下一个二的次幂是否溢出。最后分配内存并进行初始化，准备第二个hash表，为rehash做准备。</p>
+<p>可以看到，dict的扩容确实是以entry为单位，每次扩容都是之前的两倍大小。</p>
+<p>另外，dictResize函数也是调用了dictExpand函数实现的，该函数是让dict的大小刚好合适目前所有entry所需的空间。</p>
+<p>这里再对rehash操作进行解释，因为字典的空间扩展了，字典的容量以及相应的掩码会改变，这样的话hash值和掩码计算的index就会变化，从而导致根据键查找的值不存在或不正确。因此，用到了第二个hash表，作为临时存放原来数据的空间，之前的键都需要重新计算idx然后放入新的表中，新插入的数据同样放到新的表中，这就是需要rehash操作的原因。</p>
+<pre><code class="language-c">int _dictExpand(dict *d, unsigned long size, int* malloc_failed)
+{
+    if (malloc_failed) *malloc_failed = 0;
+
+    /* the size is invalid if it is smaller than the number of
+     * elements already inside the hash table */
+    if (dictIsRehashing(d) || d-&gt;ht_used[0] &gt; size)
+        return DICT_ERR;
+
+    /* the new hash table */
+    dictEntry **new_ht_table;
+    unsigned long new_ht_used;
+    signed char new_ht_size_exp = _dictNextExp(size);
+
+    /* Detect overflows */
+    size_t newsize = 1ul&lt;&lt;new_ht_size_exp;
+    if (newsize &lt; size || newsize * sizeof(dictEntry*) &lt; newsize)
+        return DICT_ERR;
+
+    /* Rehashing to the same table size is not useful. */
+    if (new_ht_size_exp == d-&gt;ht_size_exp[0]) return DICT_ERR;
+
+    /* Allocate the new hash table and initialize all pointers to NULL */
+    if (malloc_failed) {
+        new_ht_table = ztrycalloc(newsize*sizeof(dictEntry*));
+        *malloc_failed = new_ht_table == NULL;
+        if (*malloc_failed)
+            return DICT_ERR;
+    } else
+        new_ht_table = zcalloc(newsize*sizeof(dictEntry*));
+
+    new_ht_used = 0;
+
+    /* Is this the first initialization? If so it's not really a rehashing
+     * we just set the first hash table so that it can accept keys. */
+    if (d-&gt;ht_table[0] == NULL) {
+        d-&gt;ht_size_exp[0] = new_ht_size_exp;
+        d-&gt;ht_used[0] = new_ht_used;
+        d-&gt;ht_table[0] = new_ht_table;
+        return DICT_OK;
+    }
+
+    /* Prepare a second hash table for incremental rehashing */
+    d-&gt;ht_size_exp[1] = new_ht_size_exp;
+    d-&gt;ht_used[1] = new_ht_used;
+    d-&gt;ht_table[1] = new_ht_table;
+    d-&gt;rehashidx = 0;
+    return DICT_OK;
+}
+</code></pre>
+<h2 id="dict的插入操作">dict的插入操作</h2>
+<p>dict的插入操作提供给上层调用的主要是dictAdd和dictAddRaw两个函数，区别是，dictAddRaw是两阶段的插入，该函数首先检测key值是否可以插入，如果可以返回插入的entry的指针（如果不能插入则为NULL），之后调用者可以再手动设置entry的value。但其实dictAdd函数也是调用dictAddRaw实现的，只不过增加了一步setValue操作。所以分析dictAddRaw函数即可。</p>
+<p>该函数的实现可以分为两个部分，首先是dictFindPositionForInsert函数在dict中找到key应该插入的位置，如果key已经存在于dict中，那么返回NULL，否则返回应该插入的位置的指针。然后再调用dictInsertAtPosition函数插入entry。</p>
+<p>首先看dictFindPositionForInsert函数，代码如下。首先会调用dictHashKey函数计算key对应的hash值，该函数的实现又调（其实就是模运算，只不过是通过位运算来实现的）。dictType里面的计算hash的函数。如果dict正处于rehash阶段，则进行一步rehash。然后，通过hash值与一个掩码计算按位与操作得到此hash值在表中的index()，获取对应index的entry，对比该entry以及整个链表中entry的key值，判断是否已经又相同的key，如果有则返回NULL。最后根据是否在rehash，选择返回那一个table中的位置。</p>
+<pre><code class="language-c">void *dictFindPositionForInsert(dict *d, const void *key, dictEntry **existing) {
+    unsigned long idx, table;
+    dictEntry *he;
+    uint64_t hash = dictHashKey(d, key);
+    if (existing) *existing = NULL;
+    if (dictIsRehashing(d)) _dictRehashStep(d);
+
+    /* Expand the hash table if needed */
+    if (_dictExpandIfNeeded(d) == DICT_ERR)
+        return NULL;
+    for (table = 0; table &lt;= 1; table++) {
+        idx = hash &amp; DICTHT_SIZE_MASK(d-&gt;ht_size_exp[table]);
+        /* Search if this slot does not already contain the given key */
+        he = d-&gt;ht_table[table][idx];
+        while(he) {
+            void *he_key = dictGetKey(he);
+            if (key == he_key || dictCompareKeys(d, key, he_key)) {
+                if (existing) *existing = he;
+                return NULL;
+            }
+            he = dictGetNext(he);
+        }
+        if (!dictIsRehashing(d)) break;
+    }
+
+    /* If we are in the process of rehashing the hash table, the bucket is
+     * always returned in the context of the second (new) hash table. */
+    dictEntry **bucket = &amp;d-&gt;ht_table[dictIsRehashing(d) ? 1 : 0][idx];
+    return bucket;
+}
+</code></pre>
+<p>然后是dictInsertAtPosition函数，代码如下。首先判断是否在rehash阶段，并根据此选择需要插入两个hash表中的哪一个，如果正在rehash，则选择第二个表。然后调用dictEntryMetadataSize函数获取新的entry的metadata的字节大小，当然该函数的实现还是依靠dictType中的dictEntryMetadataBytes函数指针。接下来根据no_value的值，创建不同类型的entry，如果no_value为1，则创建dictEntryNoValue结构体，否则创建正常的dictEntry结构体，并设置键和解决冲突的链表指针，将表的长度加一。</p>
+<pre><code class="language-C">dictEntry *dictInsertAtPosition(dict *d, void *key, void *position) {
+    dictEntry **bucket = position; /* It's a bucket, but the API hides that. */
+    dictEntry *entry;
+
+    int htidx = dictIsRehashing(d) ? 1 : 0;
+    assert(bucket &gt;= &amp;d-&gt;ht_table[htidx][0] &amp;&amp;
+           bucket &lt;= &amp;d-&gt;ht_table[htidx][DICTHT_SIZE_MASK(d-&gt;ht_size_exp[htidx])]);
+    size_t metasize = dictEntryMetadataSize(d);
+    if (d-&gt;type-&gt;no_value) {
+        assert(!metasize); /* Entry metadata + no value not supported. */
+        if (d-&gt;type-&gt;keys_are_odd &amp;&amp; !*bucket) {
+            entry = key;
+            assert(entryIsKey(entry));
+        } else {
+            /* Allocate an entry without value. */
+            entry = createEntryNoValue(key, *bucket);
+        }
+    } else {
+        entry = zmalloc(sizeof(*entry) + metasize);
+        assert(entryIsNormal(entry)); /* Check alignment of allocation */
+        if (metasize &gt; 0) {
+            memset(dictEntryMetadata(entry), 0, metasize);
+        }
+        entry-&gt;key = key;
+        entry-&gt;next = *bucket;
+    }
+    *bucket = entry;
+    d-&gt;ht_used[htidx]++;
+
+    return entry;
+}
+</code></pre>
+<p>最后，dict的实现还为操作不同类型entry的value提供了多个函数，包括set、incr、get操作。</p>
+<h2 id="dict的rehash操作">dict的rehash操作</h2>
+<p>dict的rehash操作是渐进式的，也就是说不是一次性就将所有原本的key-value通过rehash移动到了新的表中，而是一次进行几步，直到将第一个表中的所有key-value都移动到了第二个表中。redis将rehash操作分散到了每次增删查改的操作当中，以及服务器空闲的时间。这样，在数据量很大时可以做到不影响性能。我们可以在前面插入操作的代码以及后面dict的查找操作中了解到这一点。</p>
+<p>下面按照代码进行分析。</p>
+<p>rehash操作通过int dictRehash(dict *d, int n)函数实现，如果原表中没有再需要移动的，则返回0，否则表示还有需要rehash操作的，返回1。</p>
+<p>首先第一段，判断该dict是否允许resize。其中empty_visits是本次rehash操作允许访问到的最大空bucket的数量（hash的index可能不是连续的）。</p>
+<p>随后，进行n步的rehash操作。首先找到下一个不为NULL的bucket（一个entry链表），然后对这个链表进行rehash并移动到第二个hash表中。</p>
+<p>最后，检查是否已经全部移动完毕，如果移动完毕，则将第二个表中的entry全部移动到第一个表中，并重置第二个表。</p>
+<pre><code class="language-c">int dictRehash(dict *d, int n) {
+    int empty_visits = n*10; /* Max number of empty buckets to visit. */
+    if (dict_can_resize == DICT_RESIZE_FORBID || !dictIsRehashing(d)) return 0;
+    if (dict_can_resize == DICT_RESIZE_AVOID &amp;&amp; 
+        (DICTHT_SIZE(d-&gt;ht_size_exp[1]) / DICTHT_SIZE(d-&gt;ht_size_exp[0]) &lt; dict_force_resize_ratio))
+    {
+        return 0;
+    }
+
+    while(n-- &amp;&amp; d-&gt;ht_used[0] != 0) {
+        dictEntry *de, *nextde;
+
+        /* Note that rehashidx can't overflow as we are sure there are more
+         * elements because ht[0].used != 0 */
+        assert(DICTHT_SIZE(d-&gt;ht_size_exp[0]) &gt; (unsigned long)d-&gt;rehashidx);
+        while(d-&gt;ht_table[0][d-&gt;rehashidx] == NULL) {
+            d-&gt;rehashidx++;
+            if (--empty_visits == 0) return 1;
+        }
+        de = d-&gt;ht_table[0][d-&gt;rehashidx];
+        /* Move all the keys in this bucket from the old to the new hash HT */
+        while(de) {
+            uint64_t h;
+
+            nextde = de-&gt;next;
+            /* Get the index in the new hash table */
+            h = dictHashKey(d, de-&gt;key) &amp; DICTHT_SIZE_MASK(d-&gt;ht_size_exp[1]);
+            de-&gt;next = d-&gt;ht_table[1][h];
+            d-&gt;ht_table[1][h] = de;
+            d-&gt;ht_used[0]--;
+            d-&gt;ht_used[1]++;
+            de = nextde;
+        }
+        d-&gt;ht_table[0][d-&gt;rehashidx] = NULL;
+        d-&gt;rehashidx++;
+    }
+
+    /* Check if we already rehashed the whole table... */
+    if (d-&gt;ht_used[0] == 0) {
+        zfree(d-&gt;ht_table[0]);
+        /* Copy the new ht onto the old one */
+        d-&gt;ht_table[0] = d-&gt;ht_table[1];
+        d-&gt;ht_used[0] = d-&gt;ht_used[1];
+        d-&gt;ht_size_exp[0] = d-&gt;ht_size_exp[1];
+        _dictReset(d, 1);
+        d-&gt;rehashidx = -1;
+        return 0;
+    }
+
+    /* More to rehash... */
+    return 1;
+}
+</code></pre>
+<h2 id="dict的查找">dict的查找</h2>
+<p>查找的逻辑比较简单，直接上代码。首先就可以看到调用了_dictRehashStep函数，进行1步的rehash。然后在第一个hash表中计算hash值，再和mask进行按位与操作得到index，并在链表中找到key匹配的项返回。如果链表遍历完了都没找到匹配的项，则判断是否在rehash，如果实在rehash则第二个表中可能有新的键值对没有找到，所以继续在第二个hash表中查找；否则，dict没有在rehash，也就是说第二个表中没有键值，则直接返回，说明键值不存在。</p>
+<pre><code class="language-c">dictEntry *dictFind(dict *d, const void *key)
+{
+    dictEntry *he;
+    uint64_t h, idx, table;
+
+    if (dictSize(d) == 0) return NULL; /* dict is empty */
+    if (dictIsRehashing(d)) _dictRehashStep(d);
+    h = dictHashKey(d, key);
+    for (table = 0; table &lt;= 1; table++) {
+        idx = h &amp; DICTHT_SIZE_MASK(d-&gt;ht_size_exp[table]);
+        he = d-&gt;ht_table[table][idx];
+        while(he) {
+            if (key==he-&gt;key || dictCompareKeys(d, key, he-&gt;key))
+                return he;
+            he = he-&gt;next;
+        }
+        if (!dictIsRehashing(d)) return NULL;
+    }
+    return NULL;
+}
+</code></pre>
+<h2 id="dict的删除">dict的删除</h2>
+<p>删除逻辑主要调用dictDelete函数，还有另一个比较相关的函数，dictUnlink函数。前者会直接释放被删除的entry的空间，而后者则不会直接释放，而会将该entry返回，让上层应用进行额外操作。二者都是通过dictGenericDelete函数实现的。</p>
+<p>下面主要分析dictGenericDelete函数，代码如下。首先，同样会检查是否在rehash阶段，是的话就进行一步rehash操作。</p>
+<p>否则的话，先计算hash，然后在第一个表中查找，如果找到了并且nofree为0，则直接释放空间。如果在第一个表中没有找到，则判断是否则rehash，如果是的话则在第二个表中进行查找。</p>
+<pre><code class="language-c">static dictEntry *dictGenericDelete(dict *d, const void *key, int nofree) {
+    uint64_t h, idx;
+    dictEntry *he, *prevHe;
+    int table;
+
+    /* dict is empty */
+    if (dictSize(d) == 0) return NULL;
+
+    if (dictIsRehashing(d)) _dictRehashStep(d);
+    h = dictHashKey(d, key);
+
+    for (table = 0; table &lt;= 1; table++) {
+        idx = h &amp; DICTHT_SIZE_MASK(d-&gt;ht_size_exp[table]);
+        he = d-&gt;ht_table[table][idx];
+        prevHe = NULL;
+        while(he) {
+            if (key==he-&gt;key || dictCompareKeys(d, key, he-&gt;key)) {
+                /* Unlink the element from the list */
+                if (prevHe)
+                    prevHe-&gt;next = he-&gt;next;
+                else
+                    d-&gt;ht_table[table][idx] = he-&gt;next;
+                if (!nofree) {
+                    dictFreeUnlinkedEntry(d, he);
+                }
+                d-&gt;ht_used[table]--;
+                return he;
+            }
+            prevHe = he;
+            he = he-&gt;next;
+        }
+        if (!dictIsRehashing(d)) break;
+    }
+    return NULL; /* not found */
+}
+</code></pre>
+<h2 id="dict的缩容">dict的缩容</h2>
+<p>这里主要看一下缩容的时机，因为缩容的实现dictResize也是调用dictExpand实现的。判断是否需要缩容的函数代码如下。其中HASHTABLE_MIN_FILL为10，即已经使用的大小/分配的大小的比例小于10%就会触发缩容操作。该函数位于server.c文件。</p>
+<pre><code class="language-c">int htNeedsResize(dict *dict) {
+    long long size, used;
+
+    size = dictSlots(dict);
+    used = dictSize(dict);
+    return (size &gt; DICT_HT_INITIAL_SIZE &amp;&amp;
+            (used*100/size &lt; HASHTABLE_MIN_FILL));
+}
+</code></pre>
+<h2 id="dict的遍历iterator">dict的遍历——iterator</h2>
+<p>dict的遍历有两种方式，这里先分析易于理解的iterator遍历方式。首先介绍dictIterator结构体，代码如下。d指向遍历的dict，index是当前entry在hash table中的索引，table指代两个table中第几个，safe是一个标志位，当为1时，允许在遍历过程中对dict进行修改，如果为0，则只允许读取操作。另外有一个比较陌生的字段，fingerprint，在非安全迭代器中使用，可以看作当前dict的一个状态。在初始化（第一次调用dictNext访问第一个entry时）时赋值，并在释放迭代器时检查迭代完成后的fingerprint和开始时是否相同，不相同则说明在非安全迭代过程中修改了dict，会在释放迭代器时报错。</p>
+<pre><code class="language-c">typedef struct dictIterator {
+    dict *d;
+    long index;
+    int table, safe;
+    dictEntry *entry, *nextEntry;
+    /* unsafe iterator fingerprint for misuse detection. */
+    unsigned long long fingerprint;
+} dictIterator;
+</code></pre>
+<p>然后介绍迭代器的创建，有两个相关的函数，一个用来获取普通迭代器，另一个用来获取安全迭代器。代码如下。比较简单，就不详细分析了。</p>
+<pre><code class="language-c">dictIterator *dictGetIterator(dict *d)
+{
+    dictIterator *iter = zmalloc(sizeof(*iter));
+
+    iter-&gt;d = d;
+    iter-&gt;table = 0;
+    iter-&gt;index = -1;
+    iter-&gt;safe = 0;
+    iter-&gt;entry = NULL;
+    iter-&gt;nextEntry = NULL;
+    return iter;
+}
+
+dictIterator *dictGetSafeIterator(dict *d) {
+    dictIterator *i = dictGetIterator(d);
+
+    i-&gt;safe = 1;
+    return i;
+}
+</code></pre>
+<p>其次是迭代的基本功能，依次下一个item，通过dictNext函数实现，代码如下。首先如果entry不为NULL，则直接将nextEntry赋值给entry，并让nextEntry指向下一个entry。如果entry为NULL，会在开始第一次访问时根据是否安全迭代器进行相应操作。安全迭代器会暂停当前的rehash操作，非安全迭代器会计算fingerprint。另外，如果当前hash表已经遍历完成，则会换下一个hash表从0开始遍历。</p>
+<pre><code class="language-c">dictEntry *dictNext(dictIterator *iter)
+{
+    while (1) {
+        if (iter-&gt;entry == NULL) {
+            if (iter-&gt;index == -1 &amp;&amp; iter-&gt;table == 0) {
+                if (iter-&gt;safe)
+                    dictPauseRehashing(iter-&gt;d);
+                else
+                    iter-&gt;fingerprint = dictFingerprint(iter-&gt;d);
+            }
+            iter-&gt;index++;
+            if (iter-&gt;index &gt;= (long) DICTHT_SIZE(iter-&gt;d-&gt;ht_size_exp[iter-&gt;table])) {
+                if (dictIsRehashing(iter-&gt;d) &amp;&amp; iter-&gt;table == 0) {
+                    iter-&gt;table++;
+                    iter-&gt;index = 0;
+                } else {
+                    break;
+                }
+            }
+            iter-&gt;entry = iter-&gt;d-&gt;ht_table[iter-&gt;table][iter-&gt;index];
+        } else {
+            iter-&gt;entry = iter-&gt;nextEntry;
+        }
+        if (iter-&gt;entry) {
+            /* We need to save the 'next' here, the iterator user
+             * may delete the entry we are returning. */
+            iter-&gt;nextEntry = iter-&gt;entry-&gt;next;
+            return iter-&gt;entry;
+        }
+    }
+    return NULL;
+}
+</code></pre>
+<h2 id="dict的遍历scan">dict的遍历——scan</h2>
+<p>前面的迭代器遍历会有一个问题，安全迭代器在迭代的过程中不允许rehash操作，而非安全迭代器在迭代过程中不允许对dict进行修改。并且，通过迭代器迭代一次整个dict可能会耗时过长。针对以上问题，redis提供了另一种迭代方式，允许在迭代过程中进行rehash操作。该遍历方式是由dictScan函数实现的，不过在分析源码之前，可以通过源码中该函数的注释了解scan遍历的原理。</p>
+<p>开始时使用一个为0的游标（cursor），函数内部会返回下一个可以访问的entry的index作为新的cursor。如果返回为0，则说明遍历完成。dictScan保证从遍历开始到结束，dict中的所有元素都会至少访问一次（又是同一个entry会被多次访问）。除此之外，还可以传入两个函数指针，在遍历节点时或者整理碎片时调用。</p>
+<p>计算下一个cursor的方法，代码如下。其中m0是第一个hash表的掩码，计算方法为hash表大小2的对数减一，由于hash表的大小为2的整数次方，所以掩码低位全为1。rev函数是将一个数的二进制位反转。</p>
+<pre><code class="language-c">v |= ~m0;
+v = rev(v);
+v++;
+v = rev(v);
+</code></pre>
+<p>这样做就算是在遍历的过程中dict经过了扩容或者是缩容的操作，也可以保证相同存在的元素都会被访问，具体的原因和详情这里不再介绍。</p>
+<p>dictScan函数在dict正在rehash阶段时，会先遍历小的那个hash表，再遍历大的那个hash表。如果dict没有在rehash，则直接遍历第一个hash表。</p>
+<p>另外，在一些特殊情况下，scan确实会导致统一entry被多次访问，但概率很小。</p>
+]]></content>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[Redis7.0源码阅读笔记——ziplist]]></title>
+        <id>https://zch273711.github.io/post/source_code_redis7.0_ziplist/</id>
+        <link href="https://zch273711.github.io/post/source_code_redis7.0_ziplist/">
+        </link>
+        <updated>2023-06-04T06:57:07.000Z</updated>
+        <content type="html"><![CDATA[<p>压缩列表（ziplist）是redis中zset的两种底层实现之一，另一种是skiplist，在另一篇笔记中已经对skiplist主要部分分析了。这篇笔记用来记录阅读redis中的ziplist实现源码的笔记。</p>
+<h2 id="ziplist简介">ziplist简介</h2>
+<p>ziplist的实现主要在ziplist.h和ziplist.c文件中。在ziplist.c的源码的官方注释中可以了解到，ziplist是一种被设计来提高内存使用率的数据结构，他可以存储字符串和整数类型，在ziplist头尾压入和弹出元素的时间复杂度为O(1)，但是考虑到在中间位置插入和删除会涉及内存的重新分配和复制，所以整体的时间复杂度收到ziplist占用空间的影响。</p>
+<p>压缩列表展开的形式如下：</p>
+<p><zlbytes> <zltail> <zllen> <entry> <entry> ... <entry> <zlend></p>
+<p>注意：压缩列表的四个特殊字段都按照little endian编码，即低位编址（操作系统中有讲）。</p>
+<ul>
+<li>其中zlbytes是一个32位无符号类型整数，用来记录整个压缩列表占用的字节数（包括zlbytes自己的4字节）。设置该成员是为了改变压缩列表大小时不用去遍历整个列表。</li>
+<li>zltail元素也是一个32位无符号整数类型，用来记录列表中最后一个元素的字节偏移</li>
+<li>zllen元素是一个16位无符号整数类型，用来记录整个列表的元素个数，如果元素个数大于2^16 - 2，则设置为2^16 - 1，并且需要遍历整个列表才能知道有多少个元素。</li>
+<li>zlend是一个标记字节，恒为0xFF，标志整个压缩列表的结束。</li>
+</ul>
+<h2 id="ziplist中的entry">ziplist中的entry</h2>
+<p>压缩列表中的每一个entry元素展开如下：</p>
+<p><prevlen> <encoding> <entry-data></p>
+<ul>
+<li>其中prevlen表示前一个元素所占字节数，方便反向遍历。该字段的编码规则如下：
+<ul>
+<li>如果前一个数据元素总长度小于254，则只需要一个字节。（为什么不是255呢，因为压缩列表中的zlend就是255，标志列表的结束，所以不能为255）</li>
+<li>否则当前一个元素的总长度大于等于254，则需要5个字节，其中第一个字节恒为0xFE(254)，实际表示前一个元素长度为后四个字节。</li>
+</ul>
+</li>
+<li>encoding表示当前元素的类型，有字符串和整数两种，同时encoding也会含有字符串的长度信息。可以根据encoding的第一字节的高二位分别不同长度的字符串和整数，具体的编码规则如下：
+<ul>
+<li>|00pppppp| 长度不大于63的字符串，encoding为一字节，后六位记录字符串的长度。</li>
+<li>|01pppppp|qqqqqqqq| 2字节，字节长度不大于16383的字符串，后14位记录具体长度。注意：后14位长度采用大端地址（Big Endian）。</li>
+<li>|10000000|qqqqqqqq|rrrrrrrr|ssssssss|tttttttt| 5字节，长度大于等于16384的字符串，第一字节的后六位没有使用，使用后面四个字节记录具体长度，同样采用大端地址。</li>
+<li>|11000000| 3字节，16位有符号整数，其中一字节encoding，接着后面两字节<entry-data>的整数。</li>
+<li>|11010000| 5字节，32位有符号整数，同样后面接4字节整数。</li>
+<li>|11100000| 9字节，64位有符号整数，后面接8个字节。</li>
+<li>|11110000| 4字节，24位有符号整数。</li>
+<li>|11111110| 2字节，后面接8位有符号整数。</li>
+<li>|1111xxxx| 12个立即数，也就是说后面四位直接表示数字，从0001到1101（0000，1110，1111不可用），一共12个数，从0开始。</li>
+<li>注意：和特殊字段一样，整数采用小端地址存储。</li>
+</ul>
+</li>
+<li>entry-data即存储的数据，如果存储的数据为小整数类型，则这部分会省略，直接并入encoding字段。</li>
+</ul>
+<h2 id="压缩列表的创建">压缩列表的创建</h2>
+<p>压缩列表的创建的逻辑在unsigned char *ziplistNew(void) 函数中实现，声明和定义分别位于ziplist.h，ziplist.c。具体代码如下，首先计算压缩列表头尾的字节长度，然后在内存中进行分配，随后对zlbytes、zltail、zllen三个字段进行赋值。其中intrev32ifbe函数调用了endiancov.c文件中的intrev32函数，该函数是为了将32位整数的小端存储转换为大端存储。</p>
+<pre><code class="language-c">unsigned char *ziplistNew(void) {
+    unsigned int bytes = ZIPLIST_HEADER_SIZE+ZIPLIST_END_SIZE;
+    unsigned char *zl = zmalloc(bytes);
+    ZIPLIST_BYTES(zl) = intrev32ifbe(bytes);
+    ZIPLIST_TAIL_OFFSET(zl) = intrev32ifbe(ZIPLIST_HEADER_SIZE);
+    ZIPLIST_LENGTH(zl) = 0;
+    zl[bytes-1] = ZIP_END;
+    return zl;
+}
+</code></pre>
+<h2 id="压缩列表的插入">压缩列表的插入</h2>
+<p>压缩列表的插入操作由unsigned char *ziplistInsert(unsigned char *zl, unsigned char *p, unsigned char *s, unsigned int slen)函数实现，同样在ziplist.h中定义，在ziplist.c中实现。注意，该函数的调用需要知道在压缩列表中的插入位置（p）。该函数的实现很简单，直接调用另一个函数unsigned char *__ziplistInsert(unsigned char *zl, unsigned char *p, unsigned char *s, unsigned int slen)，具体的逻辑在这个函数中实现，同样，由于有点复杂，这里分段分析。</p>
+<p><strong>首先</strong>是计算p指向的元素前一个元素的长度。可以分为三种情况：</p>
+<ul>
+<li>如果当前列表为空，则直接插入，因为前一个元素长度为0.</li>
+<li>如果插入位置在列表尾部，则需要将前一个元素的三个字段的空间加起来。</li>
+<li>如果插入位置在列表中间，则只需要获取当前p指向元素所记录的prevlen字段即可。</li>
+</ul>
+<p>代码如下，首先判断p指向的位置（需要插入的位置）是否为列表尾部（ZIP_END为255），如果不为尾部，则直接解码p指向的元素。否则通过ZIPLIST_ENTRY_TAIL宏定义获取最后一个元素，计算三个字段的和并返回。</p>
+<pre><code class="language-c">if (p[0] != ZIP_END) {
+    ZIP_DECODE_PREVLEN(p, prevlensize, prevlen);
+} else {
+    unsigned char *ptail = ZIPLIST_ENTRY_TAIL(zl);
+    if (ptail[0] != ZIP_END) {
+        prevlen = zipRawEntryLengthSafe(zl, curlen, ptail);
+    }
+}
+</code></pre>
+<p><strong>第二步</strong>，计算待插入元素所需要的字节空间，代码如下。首先尝试将传入的元素（无论字符串还是整数传入的都是字符串）进行编码，对应zipTryEncoding函数，该函数的实现调用了sds中实现的string2ll函数，尝试将字符串转换为整数。string2ll函数要求传入的字符串为严格的“整数格式”否则转换失败。</p>
+<p>尝试将字符串转换为整数后，如果成功，则计算整数需要的存储字节数，否则数据作为字符串存储，数据所占空间为字符串长度。注意到目前为止reqlen只记录了数据在entry所需要的空间，所以后面会将prevlen元素需要的空间和encoding元素需要的空间加上得到插入元素entry总的长度。具体得到的结果可以参考上面对entry结构体的介绍，因为得到prevlen和encoding元素所需长度的两个函数的判断逻辑基本符合上面对entry的分析，当然，感兴趣还是可以去看这两个函数的源码详细了解。</p>
+<pre><code class="language-c">if (zipTryEncoding(s,slen,&amp;value,&amp;encoding)) {
+
+    reqlen = zipIntSize(encoding);
+} else {
+    reqlen = slen;
+}
+reqlen += zipStorePrevEntryLength(NULL,prevlen);
+reqlen += zipStoreEntryEncoding(NULL,encoding,slen);
+</code></pre>
+<p><strong>第三步</strong>，计算下一个元素（还未在p处插入新元素时p指向的元素）所需空间的变化并分配空间，代码如下。在列表中见插入元素时，后面的第一个entry的prevlen字段可能会变化。因为插入过后它的前一个元素的长度已经改变了，并且，该字段的空间变化只有三种可能，减小4字节（此时插入的entry长度小于等于254字节）、不变、增大4字节（此时插入的entry长度大于254字节）。</p>
+<p>当前面计算的reqlen &lt; 4 &amp;&amp; nextdiff == -4 时，会产生一个问题，就是ziplist的整体长度变小了，并且接着后面会调用ziplistResize函数（里面会调用realloc函数），则可能会被realloc函数回收多余的空间导致数据丢失，因为resize操作的时候还没有移动各个entry内容，只是缩短了原来ziplist的空间。所以，如果遇到这种情况则使用forcelarge标志，这样在后面resize操作时可以进行处理。</p>
+<p>最后四行代码就是记录p相对于表头的offset，然后分配所需空间。</p>
+<pre><code class="language-c">int forcelarge = 0;
+nextdiff = (p[0] != ZIP_END) ? zipPrevLenByteDiff(p,reqlen) : 0;
+if (nextdiff == -4 &amp;&amp; reqlen &lt; 4) {
+    nextdiff = 0;
+    forcelarge = 1;
+}
+
+offset = p-zl;
+newlen = curlen+reqlen+nextdiff;
+zl = ziplistResize(zl,newlen);
+p = zl+offset;
+</code></pre>
+<p><strong>第四步</strong>，移动原先的内容，代码如下。移动后，修改下一个entry的prevlen字段，如果forcelarge为1，则该字段必为5个字节。否则会根据情况选择1字节或5字节。最后会根据情况修改ziplist中最后一个元素的偏移字段。</p>
+<pre><code class="language-c">if (p[0] != ZIP_END) {
+    memmove(p+reqlen,p-nextdiff,curlen-offset-1+nextdiff);
+
+    if (forcelarge)
+        zipStorePrevEntryLengthLarge(p+reqlen,reqlen);
+    else
+        zipStorePrevEntryLength(p+reqlen,reqlen);
+
+    ZIPLIST_TAIL_OFFSET(zl) =
+        intrev32ifbe(intrev32ifbe(ZIPLIST_TAIL_OFFSET(zl))+reqlen);
+        
+    assert(zipEntrySafe(zl, newlen, p+reqlen, &amp;tail, 1));
+    if (p[reqlen+tail.headersize+tail.len] != ZIP_END) {
+        ZIPLIST_TAIL_OFFSET(zl) =
+            intrev32ifbe(intrev32ifbe(ZIPLIST_TAIL_OFFSET(zl))+nextdiff);
+    }
+} else {
+    ZIPLIST_TAIL_OFFSET(zl) = intrev32ifbe(p-zl);
+}
+</code></pre>
+<p><strong>最后一步</strong>，进行级联更新、正式插入数据并将列表长度加一，代码如下。对于级联更新这里可以举一个例子方便理解。即在当前插入的位置及其后面所有的entry的长度都为253，并且当前插入的元素导致原本长度为253字节的entry增加4个字节（prevlen），则后面所有的entry的prevlen字节空间都需要增加4字节。</p>
+<pre><code class="language-c">if (nextdiff != 0) {
+    offset = p-zl;
+    zl = __ziplistCascadeUpdate(zl,p+reqlen);
+    p = zl+offset;
+}
+
+p += zipStorePrevEntryLength(p,prevlen);
+p += zipStoreEntryEncoding(p,encoding,slen);
+if (ZIP_IS_STR(encoding)) {
+    memcpy(p,s,slen);
+} else {
+    zipSaveInteger(p,value,encoding);
+}
+ZIPLIST_INCR_LENGTH(zl,1);
+return zl;
+</code></pre>
+<h2 id="压缩列表的删除">压缩列表的删除</h2>
+<p>列表的删除的函数为unsigned char *ziplistDelete(unsigned char *zl, unsigned char **p)，被声明在ziplist.h中，实现在ziplist.c中。该函数也是直接调用了一个内部函数unsigned char *__ziplistDelete(unsigned char *zl, unsigned char *p, unsigned int num)，后者函数可以从p指向的位置开始删除num个元素。</p>
+<p>这里还是分段分析__ziplistDelete函数的代码。</p>
+<p><strong>首先</strong>是计算需要删除的字节数，代码如下。使用first记录p指向的第一个entry（也是第一个需要删除的entry）。然后向后遍历num个entry，为需要删除的entry个数。最后使用totlen计算总的需要删除的字节数。后面的步骤只有在totlen &gt; 0的情况下才会进行，否则没有需要删除entry，直接返回。</p>
+<pre><code class="language-c">unsigned int i, totlen, deleted = 0;
+size_t offset;
+int nextdiff = 0;
+zlentry first, tail;
+size_t zlbytes = intrev32ifbe(ZIPLIST_BYTES(zl));
+
+zipEntry(p, &amp;first); 
+for (i = 0; p[0] != ZIP_END &amp;&amp; i &lt; num; i++) {
+    p += zipRawEntryLengthSafe(zl, zlbytes, p);
+    deleted++;
+}
+
+assert(p &gt;= first.p);
+totlen = p-first.p; 
+</code></pre>
+<p><strong>第二步</strong>，经过第一步，此时p已经指向了需要被删除的entry后面的第一个entry。如果p指向的是列表尾部，则不需要修改什么；否则，p指向的是一个entry元素，需要修改该entry元素的prevlen元素，因为删除过后该entry前面的entry改变了。</p>
+<p>如果p指向的是一个entry元素，首先调用zipPrevLenByteDiff函数计算prevlen字段的变化长度，同上面插入操作，nextdiff可能为-4，0，4。zipStorePrevEntryLength函数将修改p指向的entry的prevlen字段。另外，这里区分一下zipEntrySafe和zipEntry两个函数。两者都是将当前指向的entry元素解析为一个zlentry结构体，方便后面操作。区别在于前者是安全的，后者是不安全的。前者在解码的过程中会检查是否访问了ziplist所属内存空间外的内存，而后者假设传入的指向entry的指针p已经是检测过并且安全的，所以在解码的过程中不会额外检测。前者若检测到非法越界访问内存空间，则返回0，否则返回1。</p>
+<p>set_tail字段用来修改对最后一个entry的偏移。最后就是移动被删除entry后面entry的内容到前面。</p>
+<pre><code class="language-c">if (p[0] != ZIP_END) {
+    /*如果p指向的不是列表尾部，则计算当前p指向的元素的prevlen字段在删除前后的变化
+     * */
+    nextdiff = zipPrevLenByteDiff(p,first.prevrawlen);
+
+    p -= nextdiff;
+    assert(p &gt;= first.p &amp;&amp; p&lt;zl+zlbytes-1);
+    zipStorePrevEntryLength(p,first.prevrawlen);
+
+    set_tail = intrev32ifbe(ZIPLIST_TAIL_OFFSET(zl))-totlen;
+
+    assert(zipEntrySafe(zl, zlbytes, p, &amp;tail, 1));
+    if (p[tail.headersize+tail.len] != ZIP_END) {
+        set_tail = set_tail + nextdiff;
+    }
+
+    size_t bytes_to_move = zlbytes-(p-zl)-1;
+    memmove(first.p,p,bytes_to_move);
+} else {
+    set_tail = (first.p-zl)-first.prevrawlen;
+}
+</code></pre>
+<p><strong>第三步</strong>，重新分配压缩列表的空间。</p>
+<pre><code class="language-C">offset = first.p-zl;
+zlbytes -= totlen - nextdiff;
+zl = ziplistResize(zl, zlbytes);
+p = zl+offset;
+</code></pre>
+<p>第四步，设置列表的长度，设置表尾元素偏移，并进行级联更新。</p>
+<pre><code class="language-c">ZIPLIST_INCR_LENGTH(zl,-deleted);
+
+assert(set_tail &lt;= zlbytes - ZIPLIST_END_SIZE);
+ZIPLIST_TAIL_OFFSET(zl) = intrev32ifbe(set_tail);
+
+if (nextdiff != 0)
+    zl = __ziplistCascadeUpdate(zl,p);
+</code></pre>
+<p>最后，这里简单提一下压缩列表的级联更新。可以大致分为三个步骤。</p>
+<ul>
+<li>遍历一次更新位置的列表后面部分，直到一个entry不需要更新prevlen字段。对每个字段计算需要的额外空间。</li>
+<li>更新tail offset。</li>
+<li>从后往前，更新每个需要级联更新的entry的prevlen字段。</li>
+</ul>
+]]></content>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[Redis7.0 源码阅读笔记 —— SkipList]]></title>
+        <id>https://zch273711.github.io/post/source_code_redis7.0_skiplist/</id>
+        <link href="https://zch273711.github.io/post/source_code_redis7.0_skiplist/">
+        </link>
+        <updated>2023-06-01T08:15:11.000Z</updated>
+        <content type="html"><![CDATA[<p>跳表是Redis中的有序集合ZSet的底层实现之一。</p>
+<p>跳表这种数据结构可以和数组、链表、AVL树和红黑树等做比较学习。其中数组查询速度很快，但插入和删除操作时间复杂度比较高。链表很适合增删数据，但是不适合查找。AVL树和红黑树都是自动平衡二叉树，增删改查的效率都不错，区别在于保持平衡的策略，AVL树策略比较复杂，但是能保证更加平衡的结构，而红黑树对平衡性舍弃了一些，但提高了效率，二者的共同缺点在于实现的复杂。</p>
+<p>除了上面提到的，当然还有跳表，总体来说它的效率堪比两种平衡二叉树，同时实现更加简单。</p>
+<p>这里对跳表不做详细介绍，只是简单提一下，方便理解Redis中的跳表的实现。</p>
+<h2 id="跳表">跳表</h2>
+<p>首先回忆链表的实现，插入和删除只需要找到目标位置，然后改变前节点的指针和插入节点的指针即可。但是查找的时间时最坏情况需要遍历整个链表。为了减少遍历的节点，可以给链表加上“索引”。这里的索引是指在链表的上层加上额外的链表，但是节点更加稀疏，并且上下层的节点值是相同的，这样在上层检索到“下一个节点大于查找值的当前节点后”到下一层继续查找，通过这样的过程来减少遍历到的节点数。</p>
+<p>这里只是对跳表的原理进行了简述，详情可以去看网上的其他资料。</p>
+<h2 id="redis中的skiplist">Redis中的SkipList</h2>
+<p>在Redis中，跳表的结构体分为两部分，zskiplist和zskiplistnode，前者即跳表结构体，后者是方便实现而定义的跳表节点结构体，两部分都在server.h文件中定义，代码如下：</p>
+<pre><code class="language-c">/* ZSETs use a specialized version of Skiplists */
+typedef struct zskiplistNode {
+    sds ele;
+    double score;
+    struct zskiplistNode *backward;
+    struct zskiplistLevel {
+        struct zskiplistNode *forward;
+        unsigned long span;
+    } level[];
+} zskiplistNode;
+
+typedef struct zskiplist {
+    struct zskiplistNode *header, *tail;
+    unsigned long length;
+    int level;
+} zskiplist;
+</code></pre>
+<p>首先看zskiplist结构体，一共有四个成员，header和tail分别是指向跳表头节点和尾节点的指针，length是当前跳表包含的元素个数（最底层，不包含头节点），level是当前跳表的最高层数（不包含头节点）。</p>
+<p>然后是链表节点结构体，一共有四个部分，首先是ele成员，是sds类型的，是真正存储的数据。score是排序的分数，当多个节点的score分数相同，则会按照ele的字典序排序。backword是指向前一个节点的指针（注意，头节点和第一个节点的backword指针为NULL）。最后一个元素level是一个柔性数组，数组中每个元素都是一个zskiplistLevel结构体，每个结构体包含两个元素——forward（指向当前层的下一个节点）和span（表示当前节点和forward指向的节点之间跳过的节点个数）。</p>
+<h2 id="skiplist的创建">SkipList的创建</h2>
+<p>创建函数的定义在server.h中，即zslCreate，但是在t_zset.c文件中实现。代码如下。</p>
+<pre><code class="language-c">zskiplist *zslCreate(void) {
+    int j;
+    zskiplist *zsl;
+
+    zsl = zmalloc(sizeof(*zsl));
+    zsl-&gt;level = 1;
+    zsl-&gt;length = 0;
+    zsl-&gt;header = zslCreateNode(ZSKIPLIST_MAXLEVEL,0,NULL);
+    for (j = 0; j &lt; ZSKIPLIST_MAXLEVEL; j++) {
+        zsl-&gt;header-&gt;level[j].forward = NULL;
+        zsl-&gt;header-&gt;level[j].span = 0;
+    }
+    zsl-&gt;header-&gt;backward = NULL;
+    zsl-&gt;tail = NULL;
+    return zsl;
+}
+</code></pre>
+<p>对上面的创建代码进行分析。首先分配一个zskiplist结构体的内存大小，并将高度和长度分别设置为1和0。然后创建一个头节点，高度为ZSKIPLIST_MAXLEVEL，定义在server.h中，为32，所以头节点的高度为32，score为0，ele为NULL，同样的backword默认为NULL。</p>
+<h2 id="skiplist的插入操作">SkipList的插入操作</h2>
+<p>插入操作比较复杂， 这里分开解读。</p>
+<p>首先是确定插入的位置。使用x作为临时节点，当x的下一个节点的score小于插入值的score，或者score相等但是下一个节点的字典序小于插入节点，则将x置为下一个节点，并且更新rank。每一层的最后都会设置update数组。</p>
+<p>update数组是用于记录插入节点每一层的前一个节点的，rank用于记录当前层从header节点到update[i]节点的步长。</p>
+<pre><code class="language-c">zskiplistNode *update[ZSKIPLIST_MAXLEVEL], *x;
+unsigned long rank[ZSKIPLIST_MAXLEVEL];
+int i, level;
+
+serverAssert(!isnan(score));
+x = zsl-&gt;header;
+for (i = zsl-&gt;level-1; i &gt;= 0; i--) {
+    /* store rank that is crossed to reach the insert position */
+    rank[i] = i == (zsl-&gt;level-1) ? 0 : rank[i+1];
+    while (x-&gt;level[i].forward &amp;&amp;
+            (x-&gt;level[i].forward-&gt;score &lt; score ||
+                (x-&gt;level[i].forward-&gt;score == score &amp;&amp;
+                sdscmp(x-&gt;level[i].forward-&gt;ele,ele) &lt; 0)))
+    {
+        rank[i] += x-&gt;level[i].span;
+        x = x-&gt;level[i].forward;
+    }
+    update[i] = x;
+}
+</code></pre>
+<p>然后是调整跳表的高度，代码如下。首先会调用zslRandomLevel函数计算插入节点的随机高度。该函数的代码也放在下面。具体逻辑是循环生成随机数，然后和threhold比较，如果小于阈值，则加1并继续这个过程，最后返回的高度要小于等于32。</p>
+<p>计算出当前节点的高度之后，如果比插入之前的跳表的高度大，则更新rank和update数组。</p>
+<pre><code class="language-c">level = zslRandomLevel();
+if (level &gt; zsl-&gt;level) {
+    for (i = zsl-&gt;level; i &lt; level; i++) {
+        rank[i] = 0;
+        update[i] = zsl-&gt;header;
+        update[i]-&gt;level[i].span = zsl-&gt;length;
+    }
+    zsl-&gt;level = level;
+}
+
+int zslRandomLevel(void) {
+    static const int threshold = ZSKIPLIST_P*RAND_MAX;
+    int level = 1;
+    while (random() &lt; threshold)
+        level += 1;
+    return (level&lt;ZSKIPLIST_MAXLEVEL) ? level : ZSKIPLIST_MAXLEVEL;
+}
+</code></pre>
+<p>第三步是创建节点并插入，代码如下。首相创建一个zskiplistNode结构体，并对其进行插入，更新每层的前一个节点的forward指针和span。</p>
+<pre><code class="language-c">x = zslCreateNode(level,score,ele);
+for (i = 0; i &lt; level; i++) {
+    x-&gt;level[i].forward = update[i]-&gt;level[i].forward;
+    update[i]-&gt;level[i].forward = x;
+
+    /* update span covered by update[i] as x is inserted here */
+    x-&gt;level[i].span = update[i]-&gt;level[i].span - (rank[0] - rank[i]);
+    update[i]-&gt;level[i].span = (rank[0] - rank[i]) + 1;
+}
+</code></pre>
+<p>最后一段代码是对backword指针、tail指针和跳表长度进行调整，代码就不展示了。</p>
+<h2 id="skiplist的删除操作">SkipList的删除操作</h2>
+<p>该功能有zslDelete函数实现。声明在server.h中，实现在t_zset.c文件中。首先，根据官方的注释，该函数在成功找到元素并删除后返回1，否则返回0。并且，调用者可以选择是否释放掉删除节点的内存，还是将该节点返回给调用者进行复用。</p>
+<p>代码如下。首先第一段很明显是在查找要删除的目标节点，并利用update数组记录删除节点的每一层的前一节点。</p>
+<p>找到节点后，会同时比较ele和score元素，都相等才会进行删除。如果node参数为NULL则释放对应内存，否则通过node返回被删除节点。</p>
+<pre><code class="language-c">int zslDelete(zskiplist *zsl, double score, sds ele, zskiplistNode **node) {
+    zskiplistNode *update[ZSKIPLIST_MAXLEVEL], *x;
+    int i;
+
+    x = zsl-&gt;header;
+    for (i = zsl-&gt;level-1; i &gt;= 0; i--) {
+        while (x-&gt;level[i].forward &amp;&amp;
+                (x-&gt;level[i].forward-&gt;score &lt; score ||
+                    (x-&gt;level[i].forward-&gt;score == score &amp;&amp;
+                     sdscmp(x-&gt;level[i].forward-&gt;ele,ele) &lt; 0)))
+        {
+            x = x-&gt;level[i].forward;
+        }
+        update[i] = x;
+    }
+    /* We may have multiple elements with the same score, what we need
+     * is to find the element with both the right score and object. */
+    x = x-&gt;level[0].forward;
+    if (x &amp;&amp; score == x-&gt;score &amp;&amp; sdscmp(x-&gt;ele,ele) == 0) {
+        zslDeleteNode(zsl, x, update);
+        if (!node)
+            zslFreeNode(x);
+        else
+            *node = x;
+        return 1;
+    }
+    return 0; /* not found */
+}
+</code></pre>
+<p>上面函数中用到的zslDeleteNode函数代码如下，同样可以分段理解，首先是更新每一层前一节点的指针和span元素。然后调整跳表的tail指针以及长度、高度。</p>
+<pre><code class="language-C">void zslDeleteNode(zskiplist *zsl, zskiplistNode *x, zskiplistNode **update) {
+    int i;
+    for (i = 0; i &lt; zsl-&gt;level; i++) {
+        if (update[i]-&gt;level[i].forward == x) {
+            update[i]-&gt;level[i].span += x-&gt;level[i].span - 1;
+            update[i]-&gt;level[i].forward = x-&gt;level[i].forward;
+        } else {
+            update[i]-&gt;level[i].span -= 1;
+        }
+    }
+    if (x-&gt;level[0].forward) {
+        x-&gt;level[0].forward-&gt;backward = x-&gt;backward;
+    } else {
+        zsl-&gt;tail = x-&gt;backward;
+    }
+    while(zsl-&gt;level &gt; 1 &amp;&amp; zsl-&gt;header-&gt;level[zsl-&gt;level-1].forward == NULL)
+        zsl-&gt;level--;
+    zsl-&gt;length--;
+}
+</code></pre>
+<p>zskiplist的分析暂时就到这里为止，当然Redis还为该数据结构实现了许多其他的功能方便上层调用，但是基本的思想都已经通过创建、插入和删除操作分析了，理解了这三个基本操作应该就能更好地对其他部分源码阅读和理解。</p>
+]]></content>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[Redis7.0 源码阅读笔记 —— Simple Dynamic String（sds）]]></title>
+        <id>https://zch273711.github.io/post/source_code_redis7.0_sds/</id>
+        <link href="https://zch273711.github.io/post/source_code_redis7.0_sds/">
+        </link>
+        <updated>2023-05-31T14:04:30.000Z</updated>
+        <content type="html"><![CDATA[<p>sds的数据结构源码主要位于src目录下的sds.h和sds.c两个文件。其中sds.h文件主要是结构体的定义以及一些结构体成员访问方法，所有该类方法都声明为内联函数。</p>
+<h2 id="sds结构体的定义">sds结构体的定义</h2>
+<p>总的来说，redis一共有5中sds结构体定义，分别使用不同长度的int类型来记录字符串的长度，主要是为了效率和空间利用的目的。源码如下。</p>
+<pre><code class="language-C">/* Note: sdshdr5 is never used, we just access the flags byte directly.
+ * However is here to document the layout of type 5 SDS strings. */
+struct __attribute__ ((__packed__)) sdshdr5 {
+    unsigned char flags; /* 3 lsb of type, and 5 msb of string length */
+    char buf[];
+};
+struct __attribute__ ((__packed__)) sdshdr8 {
+    uint8_t len; /* used */
+    uint8_t alloc; /* excluding the header and null terminator */
+    unsigned char flags; /* 3 lsb of type, 5 unused bits */
+    char buf[];
+};
+struct __attribute__ ((__packed__)) sdshdr16 {
+    uint16_t len; /* used */
+    uint16_t alloc; /* excluding the header and null terminator */
+    unsigned char flags; /* 3 lsb of type, 5 unused bits */
+    char buf[];
+};
+struct __attribute__ ((__packed__)) sdshdr32 {
+    uint32_t len; /* used */
+    uint32_t alloc; /* excluding the header and null terminator */
+    unsigned char flags; /* 3 lsb of type, 5 unused bits */
+    char buf[];
+};
+struct __attribute__ ((__packed__)) sdshdr64 {
+    uint64_t len; /* used */
+    uint64_t alloc; /* excluding the header and null terminator */
+    unsigned char flags; /* 3 lsb of type, 5 unused bits */
+    char buf[];
+};
+</code></pre>
+<p>除了sdshdr5类型，其他四种sds类型都有len和alloc两个字段，表示字符串的长度和分配的可用长度。sdshdr5类型的长度只是用5位bit位来记录，位于flags的高5位。flags的低3位用来记录sds的类型，即是上面五种sdshdr的哪一种，在sds.h文件中通过宏定义定义类型。结构体的最后一个成员是一个柔性数组，相比指针可以减少一次内存分配，并且在连续内存有空闲的情况下可以通过realloc高效扩容。类型宏定义如下：</p>
+<pre><code class="language-c">#define SDS_TYPE_5  0
+#define SDS_TYPE_8  1
+#define SDS_TYPE_16 2
+#define SDS_TYPE_32 3
+#define SDS_TYPE_64 4
+#define SDS_TYPE_MASK 7
+</code></pre>
+<p>在做类型比较是，只需要将flag和SDS_TYPE_MASK做按位与操作即可得到sds具体类型。</p>
+<p>另外需要注意的是，创建sds结构体过后，返回给上层应用的是buf的指针，即上层应用看到的就是一个char类型的数组。但是，因为结构体的定义让编译器关闭了字节对齐，所以buf到flags的偏移位-1，可以直接通过buf指针访问flags。再通过flags判断sds具体结构体类型后可以获取len、alloc等信息。</p>
+<h2 id="sdsh中的函数定义">sds.h中的函数定义</h2>
+<p>该文件中主要声明并定义了如下函数，其中sds的定义为typedef char *sds，即指向char类型的指针。所有函数都会通过s-1访问flags判断结构类型，然后做出相应的操作。</p>
+<pre><code class="language-C">static inline size_t sdslen(const sds s); // 获取sds的长度
+static inline size_t sdsavail(const sds s);	// 获取sds可用的空间
+static inline void sdssetlen(sds s, size_t newlen); // 设置sds新的长度
+static inline void sdsinclen(sds s, size_t inc); // 将sds长度增加一个值
+static inline size_t sdsalloc(const sds s); // 获取sds最大可用长度
+static inline void sdssetalloc(sds s, size_t newlen); // 设置sds最大可用长度
+</code></pre>
+<h2 id="sdsh中的函数声明">sds.h中的函数声明</h2>
+<p>除了上述声明并定义了的函数，该文件还声明了其他许多对sds进行操作的函数，基本都在sds.c文件中实现了。例如以下函数声明：</p>
+<pre><code class="language-c">sds sdsnewlen(const void *init, size_t initlen);
+sds sdstrynewlen(const void *init, size_t initlen);
+sds sdsnew(const char *init);
+sds sdsempty(void);
+sds sdsdup(const sds s);
+void sdsfree(sds s);
+sds sdsgrowzero(sds s, size_t len);
+sds sdscatlen(sds s, const void *t, size_t len);
+sds sdscat(sds s, const char *t);
+sds sdscatsds(sds s, const sds t);
+sds sdscpylen(sds s, const char *t, size_t len);
+sds sdscpy(sds s, const char *t);
+</code></pre>
+<h2 id="sds创建">sds创建</h2>
+<p>sds创建主要涉及几个函数，这些函数都在sds.c中实现。</p>
+<pre><code class="language-c">sds sdsempty(void)	// 创建长度为0的字符串
+sds sdsnew(const char *init) // 从一个C字符串创建
+sds sdsdup(const sds s)	// 复制一个字符串
+sds sdsnewlen(const void *init, size_t initlen)
+sds sdstrynewlen(const void *init, size_t initlen)
+sds _sdsnewlen(const void *init, size_t initlen, int trymalloc)
+</code></pre>
+<p>前三个函数都会调用第四个函数，最后一个函数在sds数据结构实现时没有使用，主要是其他模块使用。第四五个函数都会调用第六个函数，所以_sdsnewlen函数才是创建sds的逻辑。下面截取该函数前部分代码进行注释说明。</p>
+<pre><code class="language-c">sds _sdsnewlen(const void *init, size_t initlen, int trymalloc) {
+    void *sh;
+    sds s;
+    char type = sdsReqType(initlen);    // 根据长度，选择合适的类型
+    // sdshdr5已经弃用，改用sdshdr8，因为字符串会频繁append操作，sdshdr5分配的空间太少
+    if (type == SDS_TYPE_5 &amp;&amp; initlen == 0) type = SDS_TYPE_8;  
+    int hdrlen = sdsHdrSize(type);  // 计算结构体长度
+    unsigned char *fp; /* flag的指针 */
+    size_t usable;
+
+    assert(initlen + hdrlen + 1 &gt; initlen); /* 防止长度溢出 */
+    sh = trymalloc?
+        s_trymalloc_usable(hdrlen+initlen+1, &amp;usable) :
+        s_malloc_usable(hdrlen+initlen+1, &amp;usable); // 分配内存，usable是实际分配的内存大小
+    if (sh == NULL) return NULL;
+    if (init==SDS_NOINIT)
+        init = NULL;
+    else if (!init)
+        memset(sh, 0, hdrlen+initlen+1);
+    s = (char*)sh+hdrlen;
+    fp = ((unsigned char*)s)-1;
+    ......
+}
+</code></pre>
+<h2 id="sds字符串拼接">sds字符串拼接</h2>
+<p>拼接涉及以下几个函数：</p>
+<pre><code class="language-c">sds sdscatlen(sds s, const void *t, size_t len) // 被下面两个函数调用，拼接的具体逻辑
+sds sdscat(sds s, const char *t) // 拼接一个sds和一个C字符串
+sds sdscatsds(sds s, const sds t)  // 拼接两个sds
+sds _sdsMakeRoomFor(sds s, size_t addlen, int greedy) // 扩容逻辑
+</code></pre>
+<p>具体的关系如注释所描述的，sdscatlen会调用_sdsMakeRoomFor进行扩容。sdscatlen的代码如下，首相调用 _sdsMakeRoomFor函数对s进行扩容，然后直接使用memcpy函数将t中的内容复制到s后面，最后设置s长度，并在sds字符串最后加上结束标志位。</p>
+<pre><code class="language-c">size_t curlen = sdslen(s);
+
+s = sdsMakeRoomFor(s,len);
+if (s == NULL) return NULL;
+memcpy(s+curlen, t, len);
+sdssetlen(s, curlen+len);
+s[curlen+len] = '\0';
+return s;
+</code></pre>
+<h2 id="sds字符串扩容">sds字符串扩容</h2>
+<p>如上面所说，扩容的具体逻辑体现在_sdsMakeRoomFor函数中。由于具体代码比较长，所以这里摘取关键点说明。</p>
+<ol>
+<li>如果可用的空间大于需要新增的字符串长度，则直接返回。</li>
+</ol>
+<pre><code class="language-c">void *sh, *newsh;
+size_t avail = sdsavail(s);
+size_t len, newlen, reqlen;
+char type, oldtype = s[-1] &amp; SDS_TYPE_MASK;
+int hdrlen;
+size_t usable;
+
+/* Return ASAP if there is enough space left. */
+if (avail &gt;= addlen) return s;
+</code></pre>
+<ol start="2">
+<li>根据greedy标志位，扩容不同的容量，如果标志位为1，则扩容比需要的空间更大的空间，否则扩容到刚好的空间。</li>
+</ol>
+<pre><code class="language-c">/* 下面的if语句，根据newlen的大小，决定怎样扩容 
+当newlen小于SDS_MAX_PREALLOC时，扩容两倍，否则扩容一个SDS_MAX_PREALLOC
+其中SDS_MAX_PREALLOC=2**20即1M */
+if (greedy == 1) {
+	if (newlen &lt; SDS_MAX_PREALLOC)
+		newlen *= 2;
+	else
+		newlen += SDS_MAX_PREALLOC;
+}
+</code></pre>
+<ol start="3">
+<li>根据计算出的扩容空间，判断具体的sds类型，如果和原类型相同，则尝试在当前内存位置后面申请连续内存，否则重新在内存区域分配结构体头部和字符串空间。</li>
+</ol>
+<pre><code class="language-C">if (oldtype==type) {
+    newsh = s_realloc_usable(sh, hdrlen+newlen+1, &amp;usable); // 新的sds结构体指针，底层调用realloc函数
+    if (newsh == NULL) return NULL;
+    s = (char*)newsh+hdrlen;
+} else {
+    newsh = s_malloc_usable(hdrlen+newlen+1, &amp;usable); // 底层调用malloc函数
+    if (newsh == NULL) return NULL;
+    memcpy((char*)newsh+hdrlen, s, len+1);
+    s_free(sh);
+    s = (char*)newsh+hdrlen;
+    s[-1] = type;
+    sdssetlen(s, len);
+}
+</code></pre>
+<h2 id="其他功能">其他功能</h2>
+<p>除了上面提到的创建、拼接sds，redis低层的sds还提供了例如copy、join、trim、toupper、tolower、substr以及和long long类型转换等函数方便上层应用调用。</p>
+]]></content>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[Hello Gridea]]></title>
+        <id>https://zch273711.github.io/post/hello-gridea/</id>
+        <link href="https://zch273711.github.io/post/hello-gridea/">
+        </link>
+        <updated>2018-12-11T16:00:00.000Z</updated>
+        <summary type="html"><![CDATA[<p>👏  欢迎使用 <strong>Gridea</strong> ！<br>
+✍️  <strong>Gridea</strong> 一个静态博客写作客户端。你可以用它来记录你的生活、心情、知识、笔记、创意... ...</p>
+]]></summary>
+        <content type="html"><![CDATA[<p>👏  欢迎使用 <strong>Gridea</strong> ！<br>
+✍️  <strong>Gridea</strong> 一个静态博客写作客户端。你可以用它来记录你的生活、心情、知识、笔记、创意... ...</p>
+<!-- more -->
+<p><a href="https://github.com/getgridea/gridea">Github</a><br>
+<a href="https://gridea.dev/">Gridea 主页</a><br>
+<a href="https://fehey.com/">示例网站</a></p>
+<h2 id="特性">特性👇</h2>
+<p>📝  你可以使用最酷的 <strong>Markdown</strong> 语法，进行快速创作</p>
+<p>🌉  你可以给文章配上精美的封面图和在文章任意位置插入图片</p>
+<p>🏷️  你可以对文章进行标签分组</p>
+<p>📋  你可以自定义菜单，甚至可以创建外部链接菜单</p>
+<p>💻  你可以在 <strong>Windows</strong>，<strong>MacOS</strong> 或 <strong>Linux</strong> 设备上使用此客户端</p>
+<p>🌎  你可以使用 <strong>𝖦𝗂𝗍𝗁𝗎𝖻 𝖯𝖺𝗀𝖾𝗌</strong> 或 <strong>Coding Pages</strong> 向世界展示，未来将支持更多平台</p>
+<p>💬  你可以进行简单的配置，接入 <a href="https://github.com/gitalk/gitalk">Gitalk</a> 或 <a href="https://github.com/SukkaW/DisqusJS">DisqusJS</a> 评论系统</p>
+<p>🇬🇧  你可以使用<strong>中文简体</strong>或<strong>英语</strong></p>
+<p>🌁  你可以任意使用应用内默认主题或任意第三方主题，强大的主题自定义能力</p>
+<p>🖥  你可以自定义源文件夹，利用 OneDrive、百度网盘、iCloud、Dropbox 等进行多设备同步</p>
+<p>🌱 当然 <strong>Gridea</strong> 还很年轻，有很多不足，但请相信，它会不停向前 🏃</p>
+<p>未来，它一定会成为你离不开的伙伴</p>
+<p>尽情发挥你的才华吧！</p>
+<p>😘 Enjoy~</p>
+]]></content>
+    </entry>
+</feed>

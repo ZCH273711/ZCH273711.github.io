@@ -1,0 +1,454 @@
+<html>
+  <head>
+    <meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Redis7.0源码阅读笔记——rax | 小崽霸的Blog</title>
+<link rel="shortcut icon" href="https://zch273711.github.io/favicon.ico?v=1688480217261">
+<link href="https://cdn.jsdelivr.net/npm/remixicon@2.3.0/fonts/remixicon.css" rel="stylesheet">
+<link rel="stylesheet" href="https://zch273711.github.io/styles/main.css">
+<link rel="alternate" type="application/atom+xml" title="Redis7.0源码阅读笔记——rax | 小崽霸的Blog - Atom Feed" href="https://zch273711.github.io/atom.xml">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Droid+Serif:400,700">
+
+
+
+    <meta name="description" content="rax数据结构是radix树的实现，redis在5.0中加入了消息队列的功能，由Stream实现，而Stream的底层采用了listpack和rax树。其中rax作为消息流的实现基础，在消息流中，以ID为key，使用listpack存储va..." />
+    <meta name="keywords" content="Redis,SourceCode" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.10.0/katex.min.css">
+    <script src="//cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.5.1/build/highlight.min.js"></script>
+  </head>
+  <body>
+    <div class="main">
+      <div class="main-content">
+        <div class="site-header">
+  <a href="https://zch273711.github.io">
+  <img class="avatar" src="https://zch273711.github.io/images/avatar.png?v=1688480217261" alt="">
+  </a>
+  <h1 class="site-title">
+    小崽霸的Blog
+  </h1>
+  <p class="site-description">
+    温故而知新
+  </p>
+  <div class="menu-container">
+    
+      
+        <a href="/" class="menu">
+          首页
+        </a>
+      
+    
+      
+        <a href="/archives" class="menu">
+          归档
+        </a>
+      
+    
+      
+        <a href="/tags" class="menu">
+          标签
+        </a>
+      
+    
+      
+        <a href="/post/about" class="menu">
+          关于
+        </a>
+      
+    
+  </div>
+  <div class="social-container">
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+  </div>
+</div>
+
+        <div class="post-detail">
+          <article class="post">
+            <h2 class="post-title">
+              Redis7.0源码阅读笔记——rax
+            </h2>
+            <div class="post-info">
+              <span>
+                2023-06-13
+              </span>
+              <span>
+                15 min read
+              </span>
+              
+                <a href="https://zch273711.github.io/tag/Vc-OScUw0/" class="post-tag">
+                  # Redis
+                </a>
+              
+                <a href="https://zch273711.github.io/tag/LTQFX9TqG/" class="post-tag">
+                  # SourceCode
+                </a>
+              
+            </div>
+            
+            <div class="post-content-wrapper">
+              <div class="post-content" v-pre>
+                <p>rax数据结构是radix树的实现，redis在5.0中加入了消息队列的功能，由Stream实现，而Stream的底层采用了listpack和rax树。其中rax作为消息流的实现基础，在消息流中，以ID为key，使用listpack存储value进行存储每一个消息。</p>
+<p>在了解rax之前，如果对前缀树有一定了解当然是最好的。在前缀树中，每一个节点只存储一个字符，而一个指针的大小就为8字节（64位机器），存在极大的空间浪费，所以，为了解决这个问题，有了rax。</p>
+<h2 id="rax结构体">rax结构体</h2>
+<p>首先看一下rax相关的结构体。</p>
+<h3 id="raxnode">raxNode</h3>
+<p>一共五个字段：</p>
+<ul>
+<li>iskey，1 bit，从根节点到当前节点前一个节点所组成的字符串是否是一个key，如果是，则data字段会存储一个指向value的指针。</li>
+<li>isnull，1 bit，如果上一个字段为1，且当前字段为0（value为NULL），则不会有8字节的指针指向value。</li>
+<li>iscompr，1 bit，当前节点是否为压缩节点，如果是压缩节点，则data中会存储一个字符串，并且只有一个子节点；如果不是压缩节点，则data会存储一个或多个字符，并且每个字符都会有一个子节点。结合redis中rax代码进行举例。
+<ul>
+<li>如果为非压缩节点，则该节点的布局是这样的： [header iscompr=0][abc][a-ptr][b-ptr][c-ptr](value-ptr?)，abc是一个字符串，实际上可以分开看作三个字符，后面按顺序接三个字符对应的三个子节点的指针，最后一个是可选的指向value的指针。</li>
+<li>如果为压缩节点，则该节点的布局是这样的： [header iscompr=1][xyz][z-ptr](value-ptr?)，xyz是一个字符串，后面一个字符串对应的子节点的指针，最后一个是可选的指向value的指针。</li>
+</ul>
+</li>
+<li>size，9 bit，如果是压缩节点，则代表data字段中字符串的长度；如果是非压缩节点，则代表子节点的个数（字符个数）</li>
+<li>data，柔性数组，存放字符（串）以及指针（子节点指针或value指针）。</li>
+</ul>
+<pre><code class="language-c">typedef struct raxNode {
+    uint32_t iskey:1;     /* Does this node contain a key? */
+    uint32_t isnull:1;    /* Associated value is NULL (don't store it). */
+    uint32_t iscompr:1;   /* Node is compressed. */
+    uint32_t size:29;     /* Number of children, or compressed string len. */
+    unsigned char data[];
+} raxNode;
+</code></pre>
+<h3 id="举例子了解rax树的结构">举例子了解rax树的结构</h3>
+<p>压缩之前：对于插入了三个字符串（三个key）的rax树而言，树长下面这样。此时每个节点都是未压缩节点，如果一个节点之前节点组成的字符串是一个key，则在当前节点采用[]表示，否则使用()表示。</p>
+<pre><code class="language-c"> *              (f) &quot;&quot;
+ *                \
+ *                (o) &quot;f&quot;
+ *                  \
+ *                  (o) &quot;fo&quot;
+ *                    \
+ *                  [t   b] &quot;foo&quot;
+ *                  /     \
+ *         &quot;foot&quot; (e)     (a) &quot;foob&quot;
+ *                /         \
+ *      &quot;foote&quot; (r)         (r) &quot;fooba&quot;
+ *              /             \
+ *    &quot;footer&quot; []             [] &quot;foobar&quot;
+</code></pre>
+<p>压缩之后如下所示。压缩就是将连续几个只有单个字符的节点压缩为一个节点表示。</p>
+<pre><code class="language-c"> *                  [&quot;foo&quot;] &quot;&quot;
+ *                     |
+ *                  [t   b] &quot;foo&quot;
+ *                  /     \
+ *        &quot;foot&quot; (&quot;er&quot;)    (&quot;ar&quot;) &quot;foob&quot;
+ *                 /          \
+ *       &quot;footer&quot; []          [] &quot;foobar&quot;
+</code></pre>
+<p>当然，这样的做法会有一个缺点，在注释中也说明了。如果在上面这颗树中想要插入first这个字符串，则需要将节点进行拆分，最后变成下面这样：</p>
+<pre><code class="language-c"> *                    (f) &quot;&quot;
+ *                    /
+ *                 (i o) &quot;f&quot;
+ *                 /   \
+ *    &quot;firs&quot;  (&quot;rst&quot;)  (o) &quot;fo&quot;
+ *              /        \
+ *    &quot;first&quot; []       [t   b] &quot;foo&quot;
+ *                     /     \
+ *           &quot;foot&quot; (&quot;er&quot;)    (&quot;ar&quot;) &quot;foob&quot;
+ *                    /          \
+ *          &quot;footer&quot; []          [] &quot;foobar&quot;
+</code></pre>
+<h3 id="rax">rax</h3>
+<p>rax结构体代表一个rax树，代码如下。numele表示插入树中的字符串个数（key的个数），numnodes表示树种结点的个数。</p>
+<pre><code class="language-c">typedef struct rax {
+    raxNode *head;
+    uint64_t numele;
+    uint64_t numnodes;
+} rax;
+</code></pre>
+<h3 id="raxstack">raxStack</h3>
+<p>raxStack结构用于存储从根节点到当前节点的路径，代码如下。</p>
+<ul>
+<li>stack用于记录路径，该指针可能指向static_items（路径较短时）或者堆空间内存；</li>
+<li>items, maxitems代表stack指向的空间的已用空间以及最大空间；</li>
+<li>static_items是一个数组，数组中的每个元素都是指针，用于存储路径；</li>
+<li>oom代表当前栈是否出现过内存溢出。</li>
+</ul>
+<pre><code class="language-c">#define RAX_STACK_STATIC_ITEMS 32
+typedef struct raxStack {
+    void ＊＊stack;
+    size_t items, maxitems;
+    void ＊static_items[RAX_STACK_STATIC_ITEMS];
+    int oom;
+} raxStack;
+</code></pre>
+<h3 id="raxiterator">raxIterator</h3>
+<p>raxIterator用于遍历Rax树中所有的key，代码如下。集合注释，每个字段很好理解。</p>
+<pre><code class="language-c">typedef struct raxIterator {
+    int flags;
+    rax ＊rt;                    /＊ Radix tree we are iterating. ＊/
+    unsigned char ＊key;          /＊ The current string. ＊/
+    void ＊data;                  /＊ Data associated to this key. ＊/
+    size_t key_len;               /＊ Current key length. ＊/
+    size_t key_max;               /＊ Max key len the current key buffer can hold. ＊/
+    unsigned char key_static_string[RAX_ITER_STATIC_LEN];
+    raxNode ＊node;                /＊ Current node. Only for unsafe iteration. ＊/
+    raxStack stack;                /＊ Stack used for unsafe iteration. ＊/
+    raxNodeCallback node_cb;       /＊Optional node callback. Normally set to NULL.＊/
+} raxIterator;
+</code></pre>
+<h2 id="rax初始化">rax初始化</h2>
+<p>比较简单，代码如下。分配空间，然后进行初始化。此时rax中没有字符串，有一个头节点。如果分配内存失败则返回NULL。</p>
+<pre><code class="language-c">rax *raxNew(void) {
+    rax *rax = rax_malloc(sizeof(*rax));
+    if (rax == NULL) return NULL;
+    rax-&gt;numele = 0;
+    rax-&gt;numnodes = 1;
+    rax-&gt;head = raxNewNode(0,0);
+    if (rax-&gt;head == NULL) {
+        rax_free(rax);
+        return NULL;
+    } else {
+        return rax;
+    }
+}
+</code></pre>
+<p>上面调用的raxNewNode函数用来创建一个新的节点，有两个参数，分别代表子结点个数以及是否有数据。该函数在创建节点时会按照子节点个数以及是否有value指针计算节点所需空间并申请。代码如下。</p>
+<pre><code class="language-c">raxNode *raxNewNode(size_t children, int datafield) {
+    size_t nodesize = sizeof(raxNode)+children+raxPadding(children)+
+                      sizeof(raxNode*)*children;
+    if (datafield) nodesize += sizeof(void*);
+    raxNode *node = rax_malloc(nodesize);
+    if (node == NULL) return NULL;
+    node-&gt;iskey = 0;
+    node-&gt;isnull = 0;
+    node-&gt;iscompr = 0;
+    node-&gt;size = children;
+    return node;
+}
+</code></pre>
+<h2 id="rax插入">rax插入</h2>
+<p>rax提供给外部的有两个插入相关函数——raxInsert和raxTryInsert，但其实两者都只是直接调用了另一个函数——raxGenericInsert，函数声明如下，其中rax指向插入的rax树，s指向key也就是待插入的字符串，len为字符串的长度，data是key对应的value，old是已有的元素，overwrite为1表示如果key已存在则覆盖value，为0则表示不覆盖。</p>
+<pre><code class="language-c">int raxGenericInsert(rax *rax, unsigned char *s, size_t len, void *data, void **old, int overwrite)
+</code></pre>
+<p>由于该函数很复杂，这里分段说明。</p>
+<p>首先是在rax中游走，看能否找到key。raxLowWalk会在树中进行查找，并记录已经查找的字符串长度，并返回为i。</p>
+<pre><code class="language-c">size_t i;
+int j = 0; 
+raxNode *h, **parentlink;
+
+debugf(&quot;### Insert %.*s with value %p\n&quot;, (int)len, s, data);
+i = raxLowWalk(rax,s,len,&amp;h,&amp;parentlink,&amp;j,NULL);
+</code></pre>
+<p>然后是判断，如果i<mark>len说明在rax存在一条路径可以组成需要插入的key，并且j</mark>0，说明查找时最终没有在一个压缩节点的字符串的中间结束。满足上面两个条件则说明要么这个key已经插入了，要么已经有个节点表示这个key只是还不是一个key节点。这种情况下只需要覆盖key节点的value指针或者再给非key节点重新分配一个value指针并设置value即可。</p>
+<pre><code class="language-c">if (i == len &amp;&amp; (!h-&gt;iscompr || j == 0 /* not in the middle if j is 0 */)) {
+    debugf(&quot;### Insert: node representing key exists\n&quot;);
+    /* Make space for the value pointer if needed. */
+    if (!h-&gt;iskey || (h-&gt;isnull &amp;&amp; overwrite)) {
+        h = raxReallocForData(h,data);
+        if (h) memcpy(parentlink,&amp;h,sizeof(h));
+    }
+    if (h == NULL) {
+        errno = ENOMEM;
+        return 0;
+    }
+
+    /* Update the existing key if there is already one. */
+    if (h-&gt;iskey) {
+        if (old) *old = raxGetData(h);
+        if (overwrite) raxSetData(h,data);
+        errno = 0;
+        return 0; /* Element already exists. */
+    }
+
+    /* Otherwise set the node as a key. Note that raxSetData()
+     * will set h-&gt;iskey. */
+    raxSetData(h,data);
+    rax-&gt;numele++;
+    return 1; /* Element inserted. */
+}
+</code></pre>
+<p>剩余的情况大致可以分为两大类（在源码注释中分为5小类，但是对前四种的处理方式一致，所以两种处理方式）。一种是插入的key是一个压缩节点的一部分（应该是前缀），则将压缩节点拆开后直接设置新的key-value即可。第二大类比较麻烦，即待插入的key在某一个位置的字符和当前压缩节点的字符串相应位置的字符不相同，则需要在拆分后的相应位置的非压缩节点中插入新key的相应不匹配的字符，之后将新key的剩余部分插入到这个非压缩节点的子节点中。</p>
+<p>如果查找key完成后，不匹配节点为某个非压缩节点，或者某个压缩节点的某个字符不匹配，进行节点拆分后导致的不匹配位置为拆分后创建的非压缩节点，此时仅仅需要将当前待匹配字符插入到这个非压缩节点上），并为其创建子节点。之后，将剩余字符放入新建的子节点中即可（如果字符长度过长，需要进行分割）。</p>
+<p>那么对于插入key的逻辑就分析到这里，因为这部分的实现的代码太长，这里就不展示了。</p>
+<h2 id="rax查找元素">rax查找元素</h2>
+<p>由raxFind函数实现，不过该函数的逻辑很简单，主要核心是和上面插入元素一样的raxLowWalk函数，这里对该函数进行详细介绍。</p>
+<p>首先看函数声明，rax是查找的rax；s指向key的内容；len是key的长度；stopnode是作为查找的最终节点返回的，但是也有可能没有找到符合的key；plink用于记录父节点中指向*stopnode的指针的位置，当*stopnode变化时，也需要修改父节点指向该节点的指针；当ts不为空时，会将查找该key的路径写入该变量。</p>
+<p>这个函数返回rax中能和key匹配的最长前缀的长度。当返回的值和len不等，则意味着rax中没有这个key。当返回的值和len相等的时候，还要检查stopnode是否为key以及是否为压缩节点。</p>
+<pre><code class="language-c">static inline size_t raxLowWalk(rax *rax, unsigned char *s, size_t len, raxNode **stopnode, raxNode ***plink, int *splitpos, raxStack *ts)
+</code></pre>
+<p>下面是代码分析。首先是变量初始化，然后开始查找。对于压缩节点，需要完全匹配该节点的字符串，否则查找失败。对于非压缩节点，挨个看有没有和当前key中的字符相同的字符，如果没有，查找失败。查找成功后，会保存到当前节点的路径，并设置一些返回值。</p>
+<pre><code class="language-c">raxNode *h = rax-&gt;head;
+raxNode **parentlink = &amp;rax-&gt;head;
+
+size_t i = 0; /* Position in the string. */
+size_t j = 0; /* Position in the node children (or bytes if compressed).*/
+while(h-&gt;size &amp;&amp; i &lt; len) {
+    debugnode(&quot;Lookup current node&quot;,h);
+    unsigned char *v = h-&gt;data;
+
+    if (h-&gt;iscompr) {
+        // 查找压缩节点，需要完全匹配，或者压缩节点只有key的一部分
+        for (j = 0; j &lt; h-&gt;size &amp;&amp; i &lt; len; j++, i++) {
+            if (v[j] != s[i]) break;
+        }
+        if (j != h-&gt;size) break;
+    } else {
+        // 查找非压缩节点，需要和每个字符进行比较
+        for (j = 0; j &lt; h-&gt;size; j++) {
+            if (v[j] == s[i]) break;
+        }
+        if (j == h-&gt;size) break;
+        i++;
+    }
+
+    if (ts) raxStackPush(ts,h); /* Save stack of parent nodes. 即保存路径 */
+    raxNode **children = raxNodeFirstChildPtr(h);
+    if (h-&gt;iscompr) j = 0; /* Compressed node only child is at index 0. */
+    memcpy(&amp;h,children+j,sizeof(h));
+    parentlink = children+j;
+    j = 0;
+}
+debugnode(&quot;Lookup stop node is&quot;,h);
+// 设置返回值 
+if (stopnode) *stopnode = h;
+if (plink) *plink = parentlink;
+if (splitpos &amp;&amp; h-&gt;iscompr) *splitpos = j;
+return i;
+</code></pre>
+<h2 id="rax删除元素">rax删除元素</h2>
+<p>由raxRemove函数实现，如果成功找到元素并删除，返回1，否则返回0。</p>
+<p>首先还是调用raxLowWalk函数查找元素，如果没找到直接返回0，否则继续进行删除操作，具体删除操作的逻辑这里不再介绍，只需要知道由于删除节点可能需要对rax再次进行压缩即可。压缩的情况大致有两种：</p>
+<ul>
+<li>某节点只有一个子节点，该子节点之前是一个key，被删除后不再是key，可以将该节点和子节点压缩为一个节点。</li>
+<li>某个节点有两个子节点，经过删除操作后，只剩下一个子节点，如果这个子节点不是key，则可以将该节点与这个子节点压缩。</li>
+</ul>
+<p>压缩过程可以分为两步：</p>
+<ul>
+<li>找到可以进行压缩的第一个元素，之后将所有可进行压缩的节点进行压缩。</li>
+<li>找到第一个可压缩节点后，进行数据压缩。由于可压缩的节点都只有一个子节点，压缩过程只需要读取每个节点的内容，创建新的节点，并填充新节点的内容即可。</li>
+</ul>
+<h2 id="rax遍历">rax遍历</h2>
+<p>rax同样提供了迭代器遍历整个rax中的元素，相关函数声明如下，并选择性进行说明：</p>
+<ul>
+<li>raxStart：初始化raxIterator结构</li>
+<li>raxSeek：初始化迭代器的位置</li>
+<li>raxRandomWalk：从当前位置开始随机游走，步数为steps，如果为steps为0，则采用1-元素个数的对数*2区间内的一个随机数。</li>
+<li>raxCompare：根据指定的操作符，将迭代器当前指向的键与指定的键进行比较。如果比较为真，返回1，否则返回0。</li>
+<li>raxStop：用于结束迭代并释放相关资源</li>
+<li>raxEOF：用于标识迭代器迭代结束</li>
+</ul>
+<pre><code class="language-c">void raxStart(raxIterator *it, rax *rt);
+int raxSeek(raxIterator *it, const char *op, unsigned char *ele, size_t len);
+int raxNext(raxIterator *it);
+int raxPrev(raxIterator *it);
+int raxRandomWalk(raxIterator *it, size_t steps);
+int raxCompare(raxIterator *iter, const char *op, unsigned char *key, size_t key_len);
+void raxStop(raxIterator *it);
+int raxEOF(raxIterator *it);
+</code></pre>
+<p>这里不再针对某些函数详细介绍，但是提一下遍历的特性。这些特性也是由rax的结构体决定的。</p>
+<ul>
+<li>如果某个节点为key，则其子节点的key按照字典序比该节点的key大。</li>
+<li>如果当前节点为非压缩节点，则其最左侧节点的key是其所有子节点的key中最小的。</li>
+</ul>
+<h2 id="参考">参考</h2>
+<p><a href="https://juejin.cn/post/7093897325415923719">深入分析redis之rax底层原理，前缀树？ - 掘金 (juejin.cn)</a></p>
+<p>《Redis5 设计与源码分析》</p>
+
+              </div>
+              <div class="toc-container">
+                <ul class="markdownIt-TOC">
+<li>
+<ul>
+<li><a href="#rax%E7%BB%93%E6%9E%84%E4%BD%93">rax结构体</a>
+<ul>
+<li><a href="#raxnode">raxNode</a></li>
+<li><a href="#%E4%B8%BE%E4%BE%8B%E5%AD%90%E4%BA%86%E8%A7%A3rax%E6%A0%91%E7%9A%84%E7%BB%93%E6%9E%84">举例子了解rax树的结构</a></li>
+<li><a href="#rax">rax</a></li>
+<li><a href="#raxstack">raxStack</a></li>
+<li><a href="#raxiterator">raxIterator</a></li>
+</ul>
+</li>
+<li><a href="#rax%E5%88%9D%E5%A7%8B%E5%8C%96">rax初始化</a></li>
+<li><a href="#rax%E6%8F%92%E5%85%A5">rax插入</a></li>
+<li><a href="#rax%E6%9F%A5%E6%89%BE%E5%85%83%E7%B4%A0">rax查找元素</a></li>
+<li><a href="#rax%E5%88%A0%E9%99%A4%E5%85%83%E7%B4%A0">rax删除元素</a></li>
+<li><a href="#rax%E9%81%8D%E5%8E%86">rax遍历</a></li>
+<li><a href="#%E5%8F%82%E8%80%83">参考</a></li>
+</ul>
+</li>
+</ul>
+
+              </div>
+            </div>
+          </article>
+        </div>
+
+        
+          <div class="next-post">
+            <div class="next">下一篇</div>
+            <a href="https://zch273711.github.io/post/source_code_redis7.0_quicklist/">
+              <h3 class="post-title">
+                Redis7.0源码阅读笔记——quicklist
+              </h3>
+            </a>
+          </div>
+        
+
+        
+
+        <div class="site-footer">
+  Powered by <a href="https://github.com/getgridea/gridea" target="_blank">Gridea</a>
+  <a class="rss" href="https://zch273711.github.io/atom.xml" target="_blank">
+    <i class="ri-rss-line"></i> RSS
+  </a>
+</div>
+
+      </div>
+    </div>
+
+    <script>
+      hljs.initHighlightingOnLoad()
+
+      let mainNavLinks = document.querySelectorAll(".markdownIt-TOC a");
+
+      // This should probably be throttled.
+      // Especially because it triggers during smooth scrolling.
+      // https://lodash.com/docs/4.17.10#throttle
+      // You could do like...
+      // window.addEventListener("scroll", () => {
+      //    _.throttle(doThatStuff, 100);
+      // });
+      // Only not doing it here to keep this Pen dependency-free.
+
+      window.addEventListener("scroll", event => {
+        let fromTop = window.scrollY;
+
+        mainNavLinks.forEach((link, index) => {
+          let section = document.getElementById(decodeURI(link.hash).substring(1));
+          let nextSection = null
+          if (mainNavLinks[index + 1]) {
+            nextSection = document.getElementById(decodeURI(mainNavLinks[index + 1].hash).substring(1));
+          }
+          if (section.offsetTop <= fromTop) {
+            if (nextSection) {
+              if (nextSection.offsetTop > fromTop) {
+                link.classList.add("current");
+              } else {
+                link.classList.remove("current");    
+              }
+            } else {
+              link.classList.add("current");
+            }
+          } else {
+            link.classList.remove("current");
+          }
+        });
+      });
+
+    </script>
+  </body>
+</html>

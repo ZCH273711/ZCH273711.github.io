@@ -1,0 +1,347 @@
+<html>
+  <head>
+    <meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Redis7.0源码阅读笔记——listpack | 小崽霸的Blog</title>
+<link rel="shortcut icon" href="https://zch273711.github.io/favicon.ico?v=1688480217261">
+<link href="https://cdn.jsdelivr.net/npm/remixicon@2.3.0/fonts/remixicon.css" rel="stylesheet">
+<link rel="stylesheet" href="https://zch273711.github.io/styles/main.css">
+<link rel="alternate" type="application/atom+xml" title="Redis7.0源码阅读笔记——listpack | 小崽霸的Blog - Atom Feed" href="https://zch273711.github.io/atom.xml">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Droid+Serif:400,700">
+
+
+
+    <meta name="description" content="listpack在redis7.0中也是一种底层的数据结构，quiklist的实现、stream的实现以及redis向外提供的六种数据结构之一的hash也需要依赖listpack的实现。这一文章将对listpack进行分析。
+listpac..." />
+    <meta name="keywords" content="Redis,SourceCode" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.10.0/katex.min.css">
+    <script src="//cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.5.1/build/highlight.min.js"></script>
+  </head>
+  <body>
+    <div class="main">
+      <div class="main-content">
+        <div class="site-header">
+  <a href="https://zch273711.github.io">
+  <img class="avatar" src="https://zch273711.github.io/images/avatar.png?v=1688480217261" alt="">
+  </a>
+  <h1 class="site-title">
+    小崽霸的Blog
+  </h1>
+  <p class="site-description">
+    温故而知新
+  </p>
+  <div class="menu-container">
+    
+      
+        <a href="/" class="menu">
+          首页
+        </a>
+      
+    
+      
+        <a href="/archives" class="menu">
+          归档
+        </a>
+      
+    
+      
+        <a href="/tags" class="menu">
+          标签
+        </a>
+      
+    
+      
+        <a href="/post/about" class="menu">
+          关于
+        </a>
+      
+    
+  </div>
+  <div class="social-container">
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+  </div>
+</div>
+
+        <div class="post-detail">
+          <article class="post">
+            <h2 class="post-title">
+              Redis7.0源码阅读笔记——listpack
+            </h2>
+            <div class="post-info">
+              <span>
+                2023-06-12
+              </span>
+              <span>
+                10 min read
+              </span>
+              
+                <a href="https://zch273711.github.io/tag/Vc-OScUw0/" class="post-tag">
+                  # Redis
+                </a>
+              
+                <a href="https://zch273711.github.io/tag/LTQFX9TqG/" class="post-tag">
+                  # SourceCode
+                </a>
+              
+            </div>
+            
+            <div class="post-content-wrapper">
+              <div class="post-content" v-pre>
+                <p>listpack在redis7.0中也是一种底层的数据结构，quiklist的实现、stream的实现以及redis向外提供的六种数据结构之一的hash也需要依赖listpack的实现。这一文章将对listpack进行分析。</p>
+<h2 id="listpack的结构">listpack的结构</h2>
+<p>首先介绍listpack的结构，具体为什么会在后面小节中解释。</p>
+<p>listpack首先由两个字段，4个字节的占用空间（以字节为单位），2个字节的总的元素个数。接着这两个字段便是一个个接着的具体数据元素（entry）。最后有一个额外的字节恒为0xFF标志listpack的结束。（原因参照listpack创建过程）</p>
+<p>具体数据（entry）也可以分为三个部分。</p>
+<ul>
+<li>首先是encoding，表示数据的编码，占用2字节。可用的编码类型有（参见listpack.c文件开头宏定义部分）：
+<ul>
+<li>7bit无符号数。0xxx xxxx，后7位存储数据。</li>
+<li>6bit长的字符串。10LL LLLL，后六位记录字符串的长度，接着后面是数据。</li>
+<li>13bit有符号整数。110x xxxx，后5位以及后面一个byte存储数据。</li>
+<li>12bit长字符串。1110 LLLL，后四位以及下一个byte记录字符串的长度，紧接着后面是字符串数据。</li>
+<li>16bit有符号整数。1111 0001，后面两个字节为数据。</li>
+<li>24bit整数。1111 0010，后三个字节为数据。</li>
+<li>32bit整数。1111 0011，后四个字节为数据。</li>
+<li>64bit整数。1111 0100，后8个字节为数据。</li>
+<li>32bit长度字符串。1111 0000，后四个字节记录字符串的长度，然后紧接着字符串内容。</li>
+</ul>
+</li>
+<li>数据，具体说明在encoding部分。</li>
+<li>backlen，记录本entry的长度，至多占用5 byte，即该字段的空间不固定。实际每个字节只有低7为记录长度，最高位为0表示后面一个字节还是backlen字段部分，如果最高位为1则表示后面是下一个entry或者整个listpack的结束。举个例子，一个两字节的backlen，二进制存储为0000 0001 1000 1000，则实际长度为000 0001 000 1000，一共14为，转换为10进制为136字节。</li>
+</ul>
+<h2 id="listpack的创建">listpack的创建</h2>
+<p>代码如下，首先是分配空间。会判断指定的capacity和LP_HDR_SIZE+1的大小再进行分配空间，也就是说分配给listpack的空间最小为LP_HDR_SIZE+1。为什么呢？首先看LP_HDR_SIZE的大小，通过宏定义为6，所以listpack最小为7。再通过后面的初始化操作看一下为什么。</p>
+<p>在分配好空间过后，会设置三个字段的值，首先看lpSetTotalBytes，这是一个宏定义，该宏定义也在下方代码中。理解后可以知道，该宏定义就是在设置listpack总的字节长度，也就是说listpack的前四个字节就是记录的listpack的总长度。接着第二个宏定义，lpSetNumElements，该宏定义就是在设置listpack中的entry个数，位于listpack开始的第5、6个字节。最后，会将lp第7个字节设置为LP_EOF，该值为0xFF，即标志listpack的最后一位。而所有插入的entry都会在第6字节后，最后一个标志位之前。这就是listpack的整体结构。</p>
+<pre><code class="language-c">unsigned char *lpNew(size_t capacity) {
+    unsigned char *lp = lp_malloc(capacity &gt; LP_HDR_SIZE+1 ? capacity : LP_HDR_SIZE+1);
+    if (lp == NULL) return NULL;
+    lpSetTotalBytes(lp,LP_HDR_SIZE+1);
+    lpSetNumElements(lp,0);
+    lp[LP_HDR_SIZE] = LP_EOF;
+    return lp;
+}
+
+#define lpSetTotalBytes(p,v) do { \
+    (p)[0] = (v)&amp;0xff; \
+    (p)[1] = ((v)&gt;&gt;8)&amp;0xff; \
+    (p)[2] = ((v)&gt;&gt;16)&amp;0xff; \
+    (p)[3] = ((v)&gt;&gt;24)&amp;0xff; \
+} while(0)
+
+#define lpSetNumElements(p,v) do { \
+    (p)[4] = (v)&amp;0xff; \
+    (p)[5] = ((v)&gt;&gt;8)&amp;0xff; \
+} while(0)
+</code></pre>
+<h2 id="listpack的插入操作">listpack的插入操作</h2>
+<p>前面说过，listpack中可以存储字符串和整数类型的数据，所以listpack也提供了两个插入相关的函数，分别用于整数和字符串的插入，函数声明如下：</p>
+<pre><code class="language-c">unsigned char *lpInsertString(unsigned char *lp, unsigned char *s, uint32_t slen,
+                              unsigned char *p, int where, unsigned char **newp);
+unsigned char *lpInsertInteger(unsigned char *lp, long long lval,
+                               unsigned char *p, int where, unsigned char **newp);
+</code></pre>
+<p>但是这两个函数的源码很简单，因为都是另外一个函数——lpInsert函数的修饰函数，所以插入的主要逻辑存在于lpInsert函数中。lpInsert函数不仅可以用来在特定位置增加元素，还可以用来删除元素。该函数比较长，而且有很详细的注释，这里首先通过注释了解该函数的功能和实现。函数的声明如下所示。</p>
+<pre><code class="language-c">unsigned char *lpInsert(unsigned char *lp, unsigned char *elestr, unsigned char *eleint,
+                        uint32_t size, unsigned char *p, int where, unsigned char **newp)
+</code></pre>
+<p>lp为操作的listpack；elestr是字符串数据；eleint是整数数据；size当elestr不为空时，指定字符串的长度；p指向要修改的位置；where表示在p位置前面、后面插入还是替换当前元素；如果elestr和eleint都为NULL，则直接移除当前位置元素。如果newp不为NULL，则设置为新增加元素的指针，并且对于所有的删除操作，newp会被设置为被删除元素后面第一个元素。</p>
+<p>下面简单看一下lpInsert源码，首先是准备部分。通过elestr和eleint都为NULL判断是否是删除操作。如果是删除操作则将where设置为replace。然后判断是否在当前元素后面插入，如果是，直接转移到下一个元素并进行前向插入操作。也就是说本函数实际上只处理在前面插入和替换操作。</p>
+<pre><code class="language-c">unsigned char intenc[LP_MAX_INT_ENCODING_LEN];
+unsigned char backlen[LP_MAX_BACKLEN_SIZE];
+
+uint64_t enclen; /* The length of the encoded element. */
+int delete = (elestr == NULL &amp;&amp; eleint == NULL);
+
+if (delete) where = LP_REPLACE;
+
+if (where == LP_AFTER) {
+    p = lpSkip(p);
+    where = LP_BEFORE;
+    ASSERT_INTEGRITY(lp, p);
+}
+</code></pre>
+<p>然后是编码部分，首先，如果传入的是字符串，则调用lpEncodeGetType函数尝试编码为整数类型。如果字符串可以编码为整数类型，则intenc中会存储将字符串转换为整数的内容，enclen表示编码的长度。</p>
+<pre><code class="language-c">int enctype;
+if (elestr) {
+    enctype = lpEncodeGetType(elestr,size,intenc,&amp;enclen);
+    if (enctype == LP_ENCODING_INT) eleint = intenc;
+} else if (eleint) {
+    enctype = LP_ENCODING_INT;
+    enclen = size; /* 'size' is the length of the encoded integer element. */
+} else {
+    enctype = -1;
+    enclen = 0;
+}
+</code></pre>
+<p>下一步是计算修改后listpack所需的空间。</p>
+<pre><code class="language-c">unsigned long backlen_size = (!delete) ? lpEncodeBacklen(backlen,enclen) : 0;
+uint64_t old_listpack_bytes = lpGetTotalBytes(lp);
+uint32_t replaced_len  = 0;
+if (where == LP_REPLACE) {
+    replaced_len = lpCurrentEncodedSizeUnsafe(p);
+    replaced_len += lpEncodeBacklen(NULL,replaced_len);
+    ASSERT_INTEGRITY_LEN(lp, p, replaced_len);
+}
+
+uint64_t new_listpack_bytes = old_listpack_bytes + enclen + backlen_size
+                              - replaced_len;
+if (new_listpack_bytes &gt; UINT32_MAX) return NULL;
+</code></pre>
+<p>然后是重新分配空间。</p>
+<pre><code class="language-c">unsigned char *dst = lp + poff; /* May be updated after reallocation. */
+
+/* Realloc before: we need more room. */
+if (new_listpack_bytes &gt; old_listpack_bytes &amp;&amp;
+    new_listpack_bytes &gt; lp_malloc_size(lp)) {
+    if ((lp = lp_realloc(lp,new_listpack_bytes)) == NULL) return NULL;
+    dst = lp + poff;
+}
+
+/* Setup the listpack relocating the elements to make the exact room
+ * we need to store the new one. */
+if (where == LP_BEFORE) {
+    memmove(dst+enclen+backlen_size,dst,old_listpack_bytes-poff);
+} else { /* LP_REPLACE. */
+    long lendiff = (enclen+backlen_size)-replaced_len;
+    memmove(dst+replaced_len+lendiff,
+            dst+replaced_len,
+            old_listpack_bytes-poff-replaced_len);
+}
+
+/* Realloc after: we need to free space. */
+if (new_listpack_bytes &lt; old_listpack_bytes) {
+    if ((lp = lp_realloc(lp,new_listpack_bytes)) == NULL) return NULL;
+    dst = lp + poff;
+}
+</code></pre>
+<p>最后就是将元素插入并且更新listpack的其他字段，这里源码没有展示。</p>
+<h2 id="listpack整数的插入">listpack整数的插入</h2>
+<p>listpack对于整数的处理有一点指的介绍。在listpack中所有整数都是以非负的形式存储的。例如，如果想要存储一个16位有符号整数，则会以16位无符号数的形式存储，对于16位有符号整数的负数，会以16位无符号整数的较大范围存储。举个例子，对于一个16位有符号整数，范围为-32768 — 32767，如果存储0—32767会直接存储，对于-32768 — -1，会加上2^16，将相加的结果存储。这一点可以在listpack.c中的lpEncodeIntegerGetType函数得知。</p>
+<h2 id="listpack的获取">listpack的获取</h2>
+<p>通过lpGet函数，可以获取listpack中指定位置的元素的值。函数声明如下。其实该函数的实现只是调用了一个更底层的函数lpGetWithSize，所以这里介绍一下lpGet函数的功能。</p>
+<p>lpGet用于获取p指向的listpack中存储的元素：当元素采用字符串编码时，返回字符串的第一个元素位置，count为元素个数；当采用整型编码时，若intbuf不为空，则将整型数据转换为字符串存储在intbuf中，count为元素个数，并返回intbuf。若intbuf为空，直接将数据存储在count中，返回null。</p>
+<pre><code class="language-c">unsigned char *lpGet(unsigned char *p, int64_t *count, unsigned char *intbuf)
+</code></pre>
+<p>而lpGetWithSize函数的实现步骤上也比较简单，主要是需要判断不同类型的编码，然后采用相应的解码方式。但是除了可以获取元素内容之外，还可以给一个额外参数给lpGetWithSize函数，一个指针，若该参数不为NULL，则会返回listpack中该位置元素的字节长度。</p>
+<h2 id="listpack的其他接口">listpack的其他接口</h2>
+<h3 id="遍历">遍历</h3>
+<p>listpack还提供了一些函数方便对listpack进行遍历，函数声明如下：</p>
+<pre><code class="language-c">unsigned char *lpFirst(unsigned char *lp);
+unsigned char *lpLast(unsigned char *lp);
+unsigned char *lpNext(unsigned char *lp, unsigned char *p);
+unsigned char *lpPrev(unsigned char *lp, unsigned char *p);
+</code></pre>
+<h3 id="修改">修改</h3>
+<p>除了插入操作，还提供了replace、delete、append等相应操作的函数，但是基本都是依靠lpInsert函数实现的，所以理解了lpInsert函数即可。</p>
+<pre><code class="language-c">unsigned char *lpPrepend(unsigned char *lp, unsigned char *s, uint32_t slen);
+unsigned char *lpPrependInteger(unsigned char *lp, long long lval);
+unsigned char *lpAppend(unsigned char *lp, unsigned char *s, uint32_t slen);
+unsigned char *lpAppendInteger(unsigned char *lp, long long lval);
+unsigned char *lpReplace(unsigned char *lp, unsigned char **p, unsigned char *s, uint32_t slen);
+unsigned char *lpReplaceInteger(unsigned char *lp, unsigned char **p, long long lval);
+unsigned char *lpDelete(unsigned char *lp, unsigned char *p, unsigned char **newp);
+unsigned char *lpDeleteRangeWithEntry(unsigned char *lp, unsigned char **p, unsigned long num);
+unsigned char *lpDeleteRange(unsigned char *lp, long index, unsigned long num);
+</code></pre>
+<p>listpack源码就先看到这里。</p>
+
+              </div>
+              <div class="toc-container">
+                <ul class="markdownIt-TOC">
+<li>
+<ul>
+<li><a href="#listpack%E7%9A%84%E7%BB%93%E6%9E%84">listpack的结构</a></li>
+<li><a href="#listpack%E7%9A%84%E5%88%9B%E5%BB%BA">listpack的创建</a></li>
+<li><a href="#listpack%E7%9A%84%E6%8F%92%E5%85%A5%E6%93%8D%E4%BD%9C">listpack的插入操作</a></li>
+<li><a href="#listpack%E6%95%B4%E6%95%B0%E7%9A%84%E6%8F%92%E5%85%A5">listpack整数的插入</a></li>
+<li><a href="#listpack%E7%9A%84%E8%8E%B7%E5%8F%96">listpack的获取</a></li>
+<li><a href="#listpack%E7%9A%84%E5%85%B6%E4%BB%96%E6%8E%A5%E5%8F%A3">listpack的其他接口</a>
+<ul>
+<li><a href="#%E9%81%8D%E5%8E%86">遍历</a></li>
+<li><a href="#%E4%BF%AE%E6%94%B9">修改</a></li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+
+              </div>
+            </div>
+          </article>
+        </div>
+
+        
+          <div class="next-post">
+            <div class="next">下一篇</div>
+            <a href="https://zch273711.github.io/post/source_code_redis7.0_intset/">
+              <h3 class="post-title">
+                Redis7.0源码阅读笔记——intset
+              </h3>
+            </a>
+          </div>
+        
+
+        
+
+        <div class="site-footer">
+  Powered by <a href="https://github.com/getgridea/gridea" target="_blank">Gridea</a>
+  <a class="rss" href="https://zch273711.github.io/atom.xml" target="_blank">
+    <i class="ri-rss-line"></i> RSS
+  </a>
+</div>
+
+      </div>
+    </div>
+
+    <script>
+      hljs.initHighlightingOnLoad()
+
+      let mainNavLinks = document.querySelectorAll(".markdownIt-TOC a");
+
+      // This should probably be throttled.
+      // Especially because it triggers during smooth scrolling.
+      // https://lodash.com/docs/4.17.10#throttle
+      // You could do like...
+      // window.addEventListener("scroll", () => {
+      //    _.throttle(doThatStuff, 100);
+      // });
+      // Only not doing it here to keep this Pen dependency-free.
+
+      window.addEventListener("scroll", event => {
+        let fromTop = window.scrollY;
+
+        mainNavLinks.forEach((link, index) => {
+          let section = document.getElementById(decodeURI(link.hash).substring(1));
+          let nextSection = null
+          if (mainNavLinks[index + 1]) {
+            nextSection = document.getElementById(decodeURI(mainNavLinks[index + 1].hash).substring(1));
+          }
+          if (section.offsetTop <= fromTop) {
+            if (nextSection) {
+              if (nextSection.offsetTop > fromTop) {
+                link.classList.add("current");
+              } else {
+                link.classList.remove("current");    
+              }
+            } else {
+              link.classList.add("current");
+            }
+          } else {
+            link.classList.remove("current");
+          }
+        });
+      });
+
+    </script>
+  </body>
+</html>

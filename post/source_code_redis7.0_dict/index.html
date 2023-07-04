@@ -1,0 +1,648 @@
+<html>
+  <head>
+    <meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Redis7.0源码阅读笔记——dict | 小崽霸的Blog</title>
+<link rel="shortcut icon" href="https://zch273711.github.io/favicon.ico?v=1688480217261">
+<link href="https://cdn.jsdelivr.net/npm/remixicon@2.3.0/fonts/remixicon.css" rel="stylesheet">
+<link rel="stylesheet" href="https://zch273711.github.io/styles/main.css">
+<link rel="alternate" type="application/atom+xml" title="Redis7.0源码阅读笔记——dict | 小崽霸的Blog - Atom Feed" href="https://zch273711.github.io/atom.xml">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Droid+Serif:400,700">
+
+
+
+    <meta name="description" content="字典在Redis中拥有很重要的地位，因为Redis整个就是一个内存键值对数据库，所以其存储的基本格式都是字典。
+dict结构体定义
+字典相关的实现在dict.h和dict.c文件中，其中字典的结构体定义在dict.h中，代码如下。下面对各个..." />
+    <meta name="keywords" content="Redis,SourceCode" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.10.0/katex.min.css">
+    <script src="//cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.5.1/build/highlight.min.js"></script>
+  </head>
+  <body>
+    <div class="main">
+      <div class="main-content">
+        <div class="site-header">
+  <a href="https://zch273711.github.io">
+  <img class="avatar" src="https://zch273711.github.io/images/avatar.png?v=1688480217261" alt="">
+  </a>
+  <h1 class="site-title">
+    小崽霸的Blog
+  </h1>
+  <p class="site-description">
+    温故而知新
+  </p>
+  <div class="menu-container">
+    
+      
+        <a href="/" class="menu">
+          首页
+        </a>
+      
+    
+      
+        <a href="/archives" class="menu">
+          归档
+        </a>
+      
+    
+      
+        <a href="/tags" class="menu">
+          标签
+        </a>
+      
+    
+      
+        <a href="/post/about" class="menu">
+          关于
+        </a>
+      
+    
+  </div>
+  <div class="social-container">
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+  </div>
+</div>
+
+        <div class="post-detail">
+          <article class="post">
+            <h2 class="post-title">
+              Redis7.0源码阅读笔记——dict
+            </h2>
+            <div class="post-info">
+              <span>
+                2023-06-07
+              </span>
+              <span>
+                23 min read
+              </span>
+              
+                <a href="https://zch273711.github.io/tag/Vc-OScUw0/" class="post-tag">
+                  # Redis
+                </a>
+              
+                <a href="https://zch273711.github.io/tag/LTQFX9TqG/" class="post-tag">
+                  # SourceCode
+                </a>
+              
+            </div>
+            
+            <div class="post-content-wrapper">
+              <div class="post-content" v-pre>
+                <p>字典在Redis中拥有很重要的地位，因为Redis整个就是一个内存键值对数据库，所以其存储的基本格式都是字典。</p>
+<h2 id="dict结构体定义">dict结构体定义</h2>
+<p>字典相关的实现在dict.h和dict.c文件中，其中字典的结构体定义在dict.h中，代码如下。下面对各个字段进行解释。</p>
+<ul>
+<li>type，指向dictType类型的指针，该类型中声明了很多函数指针，类似于Golang中的非空Interface。由于字典在Redis中的应用很广，需要用到一些额外的特性和功能，所以抽象出来到dictType中，对于不同类型的应用可以进行对应的实现。后面会对该结构体里面的函数的作用做介绍。</li>
+<li>ht_table，两个指向指向dictEntry的指针的指针，其实就是存储的具体的键值对数据，后面对dictEntry结构体做详细介绍。至于为什么会有两个，可能是因为在dict使用的过程中会涉及rehash等操作。</li>
+<li>ht_used，标志两个hash表是否在使用，以及有多少个entry。</li>
+<li>rehashidx，表示是否在rehash阶段，以及rehash的item的index。如果没有在rehash阶段，则为-1。</li>
+<li>pauserehash，表示rehash操作是否被暂停，大于0表示暂停，小于0表示错误。</li>
+<li>ht_size_exp记录两个hash表的大小（以entry为单位），存储的值为大小的2的对数。</li>
+<li>metadata，任意字节数的空间，由dictType中的dictMetadataBytes函数定义大小。注释可能有误，因为在创建dict时确实是调用dictMetadataBytes函数返回的大小。</li>
+</ul>
+<pre><code class="language-c">struct dict {
+    dictType *type;
+
+    dictEntry **ht_table[2];
+    unsigned long ht_used[2];
+
+    long rehashidx; /* rehashing not in progress if rehashidx == -1 */
+
+    /* Keep small vars at end for optimal (minimal) struct padding */
+    int16_t pauserehash; /* If &gt;0 rehashing is paused (&lt;0 indicates coding error) */
+    signed char ht_size_exp[2]; /* exponent of size. (size = 1&lt;&lt;exp) */
+
+    void *metadata[];           /* An arbitrary number of bytes (starting at a
+                                 * pointer-aligned address) of size as defined
+                                 * by dictType's dictEntryBytes. */
+};
+</code></pre>
+<h2 id="dictentry结构体定义">dictEntry结构体定义</h2>
+<p>该定义在dict.c文件中，用来存储一个键值对，代码如下。各个字段的介绍：</p>
+<ul>
+<li>key，指向键的数据。</li>
+<li>v，一个联合体，存放值，不同场景下使用不同类型的值，例如，用字典存储整个redis所有的键值对时，使用的是val字段。在被用来记录键的过期时间时，用的是s64字段。</li>
+<li>next，hash冲突时的链表中的下一个dictEntry。</li>
+<li>metadata，由dictType中的dictEntryMetadataBytes函数定义大小。</li>
+</ul>
+<pre><code class="language-c">struct dictEntry {
+    void *key;
+    union {
+        void *val;
+        uint64_t u64;
+        int64_t s64;
+        double d;
+    } v;
+    struct dictEntry *next;     /* Next entry in the same hash bucket. */
+    void *metadata[];           /* An arbitrary number of bytes (starting at a
+                                 * pointer-aligned address) of size as returned
+                                 * by dictType's dictEntryMetadataBytes(). */
+};
+</code></pre>
+<h2 id="dicttype结构体定义">dictType结构体定义</h2>
+<p>该结构体定义在dict.h文件中，代码如下。前面的几个函数指针都是对键和值的基本操作，例如第一个就是自定义的哈希函数。主要看下面两个属性，当no_value为1，则dict中的entry是没有value的，只有key，即整个dict变成了一个set。同时，dictSetKey函数和dictEntry中的metadata也无法使用。另外，当no_value为1，并且设置keys_are_odd为1时，可以更进一步优化，不用dictEntry进行存储，更加节省空间。这些都是从注释直接了解到的。</p>
+<pre><code class="language-c">typedef struct dictType {
+    uint64_t (*hashFunction)(const void *key);
+    void *(*keyDup)(dict *d, const void *key);
+    void *(*valDup)(dict *d, const void *obj);
+    int (*keyCompare)(dict *d, const void *key1, const void *key2);
+    void (*keyDestructor)(dict *d, void *key);
+    void (*valDestructor)(dict *d, void *obj);
+    int (*expandAllowed)(size_t moreMem, double usedRatio);
+    /* Flags */
+    /* The 'no_value' flag, if set, indicates that values are not used, i.e. the
+     * dict is a set. When this flag is set, it's not possible to access the
+     * value of a dictEntry and it's also impossible to use dictSetKey(). Entry
+     * metadata can also not be used. */
+    unsigned int no_value:1;
+    /* If no_value = 1 and all keys are odd (LSB=1), setting keys_are_odd = 1
+     * enables one more optimization: to store a key without an allocated
+     * dictEntry. */
+    unsigned int keys_are_odd:1;
+    /* TODO: Add a 'keys_are_even' flag and use a similar optimization if that
+     * flag is set. */
+
+    /* Allow each dict and dictEntry to carry extra caller-defined metadata. The
+     * extra memory is initialized to 0 when allocated.
+     * 下面第二个函数在创建dict时会用到，用来计算额外metadata需要的空间。
+     * 第一个函数应该是在创建dictEntry时用到，返回dictEntry中metadata的大小。
+     */
+    size_t (*dictEntryMetadataBytes)(dict *d);
+    size_t (*dictMetadataBytes)(void);
+    /* Optional callback called after an entry has been reallocated (due to
+     * active defrag). Only called if the entry has metadata. */
+    void (*afterReplaceEntry)(dict *d, dictEntry *entry);
+} dictType;
+</code></pre>
+<h2 id="dict的创建操作">dict的创建操作</h2>
+<p>字典的创建操作体现在dictCreate函数中，整体实现比较简单，代码如下。首先会调用dictType中的dictMetadataBytes函数获取dict中metadata的字节数空间，然后分配空间。再调用_dictInit函数进行初始化。可以看见，rehashidx字段为-1，pauserehash字段为0。 _dictReset函数是设置三个和hash表相关的字段，将hash表设置为NULL，大小的2对数设置为-1，hash表使用字段设置为0。</p>
+<pre><code class="language-c">static void _dictReset(dict *d, int htidx)
+{
+    d-&gt;ht_table[htidx] = NULL;
+    d-&gt;ht_size_exp[htidx] = -1;
+    d-&gt;ht_used[htidx] = 0;
+}
+
+/* Create a new hash table */
+dict *dictCreate(dictType *type)
+{
+    size_t metasize = type-&gt;dictMetadataBytes ? type-&gt;dictMetadataBytes() : 0;
+    dict *d = zmalloc(sizeof(*d) + metasize);
+    if (metasize) {
+        memset(dictMetadata(d), 0, metasize);
+    }
+
+    _dictInit(d,type);
+    return d;
+}
+
+/* Initialize the hash table */
+int _dictInit(dict *d, dictType *type)
+{
+    _dictReset(d, 0);
+    _dictReset(d, 1);
+    d-&gt;type = type;
+    d-&gt;rehashidx = -1;
+    d-&gt;pauserehash = 0;
+    return DICT_OK;
+}
+</code></pre>
+<h2 id="dict扩展操作">dict扩展操作</h2>
+<p>和dict的扩展操作相关的函数一共有三个函数，分别是dictExpand、dictTryExpand、_dictExpand三个函数。前两个函数基本都是直接调用第三个函数进行dict的扩展操作。前两者的区别在于，前者是直接调用并返回 _dictExpand函数的结果，而后者会多一个判断是否在 _dictExpand中分配内存出错的参数，作为指针传入 _dictExpand函数。下面对扩展操作进行简要分析。</p>
+<p>首先会判断当前大小是否小于已经使用的大小，是的话直接返回。如果目标size确实更大，则调用_dictNextExp函数获取比size更大的下一个2的整数幂次的数对应的幂次（new_ht_size_exp）。然后做进一步的判断下一个二的次幂是否溢出。最后分配内存并进行初始化，准备第二个hash表，为rehash做准备。</p>
+<p>可以看到，dict的扩容确实是以entry为单位，每次扩容都是之前的两倍大小。</p>
+<p>另外，dictResize函数也是调用了dictExpand函数实现的，该函数是让dict的大小刚好合适目前所有entry所需的空间。</p>
+<p>这里再对rehash操作进行解释，因为字典的空间扩展了，字典的容量以及相应的掩码会改变，这样的话hash值和掩码计算的index就会变化，从而导致根据键查找的值不存在或不正确。因此，用到了第二个hash表，作为临时存放原来数据的空间，之前的键都需要重新计算idx然后放入新的表中，新插入的数据同样放到新的表中，这就是需要rehash操作的原因。</p>
+<pre><code class="language-c">int _dictExpand(dict *d, unsigned long size, int* malloc_failed)
+{
+    if (malloc_failed) *malloc_failed = 0;
+
+    /* the size is invalid if it is smaller than the number of
+     * elements already inside the hash table */
+    if (dictIsRehashing(d) || d-&gt;ht_used[0] &gt; size)
+        return DICT_ERR;
+
+    /* the new hash table */
+    dictEntry **new_ht_table;
+    unsigned long new_ht_used;
+    signed char new_ht_size_exp = _dictNextExp(size);
+
+    /* Detect overflows */
+    size_t newsize = 1ul&lt;&lt;new_ht_size_exp;
+    if (newsize &lt; size || newsize * sizeof(dictEntry*) &lt; newsize)
+        return DICT_ERR;
+
+    /* Rehashing to the same table size is not useful. */
+    if (new_ht_size_exp == d-&gt;ht_size_exp[0]) return DICT_ERR;
+
+    /* Allocate the new hash table and initialize all pointers to NULL */
+    if (malloc_failed) {
+        new_ht_table = ztrycalloc(newsize*sizeof(dictEntry*));
+        *malloc_failed = new_ht_table == NULL;
+        if (*malloc_failed)
+            return DICT_ERR;
+    } else
+        new_ht_table = zcalloc(newsize*sizeof(dictEntry*));
+
+    new_ht_used = 0;
+
+    /* Is this the first initialization? If so it's not really a rehashing
+     * we just set the first hash table so that it can accept keys. */
+    if (d-&gt;ht_table[0] == NULL) {
+        d-&gt;ht_size_exp[0] = new_ht_size_exp;
+        d-&gt;ht_used[0] = new_ht_used;
+        d-&gt;ht_table[0] = new_ht_table;
+        return DICT_OK;
+    }
+
+    /* Prepare a second hash table for incremental rehashing */
+    d-&gt;ht_size_exp[1] = new_ht_size_exp;
+    d-&gt;ht_used[1] = new_ht_used;
+    d-&gt;ht_table[1] = new_ht_table;
+    d-&gt;rehashidx = 0;
+    return DICT_OK;
+}
+</code></pre>
+<h2 id="dict的插入操作">dict的插入操作</h2>
+<p>dict的插入操作提供给上层调用的主要是dictAdd和dictAddRaw两个函数，区别是，dictAddRaw是两阶段的插入，该函数首先检测key值是否可以插入，如果可以返回插入的entry的指针（如果不能插入则为NULL），之后调用者可以再手动设置entry的value。但其实dictAdd函数也是调用dictAddRaw实现的，只不过增加了一步setValue操作。所以分析dictAddRaw函数即可。</p>
+<p>该函数的实现可以分为两个部分，首先是dictFindPositionForInsert函数在dict中找到key应该插入的位置，如果key已经存在于dict中，那么返回NULL，否则返回应该插入的位置的指针。然后再调用dictInsertAtPosition函数插入entry。</p>
+<p>首先看dictFindPositionForInsert函数，代码如下。首先会调用dictHashKey函数计算key对应的hash值，该函数的实现又调（其实就是模运算，只不过是通过位运算来实现的）。dictType里面的计算hash的函数。如果dict正处于rehash阶段，则进行一步rehash。然后，通过hash值与一个掩码计算按位与操作得到此hash值在表中的index()，获取对应index的entry，对比该entry以及整个链表中entry的key值，判断是否已经又相同的key，如果有则返回NULL。最后根据是否在rehash，选择返回那一个table中的位置。</p>
+<pre><code class="language-c">void *dictFindPositionForInsert(dict *d, const void *key, dictEntry **existing) {
+    unsigned long idx, table;
+    dictEntry *he;
+    uint64_t hash = dictHashKey(d, key);
+    if (existing) *existing = NULL;
+    if (dictIsRehashing(d)) _dictRehashStep(d);
+
+    /* Expand the hash table if needed */
+    if (_dictExpandIfNeeded(d) == DICT_ERR)
+        return NULL;
+    for (table = 0; table &lt;= 1; table++) {
+        idx = hash &amp; DICTHT_SIZE_MASK(d-&gt;ht_size_exp[table]);
+        /* Search if this slot does not already contain the given key */
+        he = d-&gt;ht_table[table][idx];
+        while(he) {
+            void *he_key = dictGetKey(he);
+            if (key == he_key || dictCompareKeys(d, key, he_key)) {
+                if (existing) *existing = he;
+                return NULL;
+            }
+            he = dictGetNext(he);
+        }
+        if (!dictIsRehashing(d)) break;
+    }
+
+    /* If we are in the process of rehashing the hash table, the bucket is
+     * always returned in the context of the second (new) hash table. */
+    dictEntry **bucket = &amp;d-&gt;ht_table[dictIsRehashing(d) ? 1 : 0][idx];
+    return bucket;
+}
+</code></pre>
+<p>然后是dictInsertAtPosition函数，代码如下。首先判断是否在rehash阶段，并根据此选择需要插入两个hash表中的哪一个，如果正在rehash，则选择第二个表。然后调用dictEntryMetadataSize函数获取新的entry的metadata的字节大小，当然该函数的实现还是依靠dictType中的dictEntryMetadataBytes函数指针。接下来根据no_value的值，创建不同类型的entry，如果no_value为1，则创建dictEntryNoValue结构体，否则创建正常的dictEntry结构体，并设置键和解决冲突的链表指针，将表的长度加一。</p>
+<pre><code class="language-C">dictEntry *dictInsertAtPosition(dict *d, void *key, void *position) {
+    dictEntry **bucket = position; /* It's a bucket, but the API hides that. */
+    dictEntry *entry;
+
+    int htidx = dictIsRehashing(d) ? 1 : 0;
+    assert(bucket &gt;= &amp;d-&gt;ht_table[htidx][0] &amp;&amp;
+           bucket &lt;= &amp;d-&gt;ht_table[htidx][DICTHT_SIZE_MASK(d-&gt;ht_size_exp[htidx])]);
+    size_t metasize = dictEntryMetadataSize(d);
+    if (d-&gt;type-&gt;no_value) {
+        assert(!metasize); /* Entry metadata + no value not supported. */
+        if (d-&gt;type-&gt;keys_are_odd &amp;&amp; !*bucket) {
+            entry = key;
+            assert(entryIsKey(entry));
+        } else {
+            /* Allocate an entry without value. */
+            entry = createEntryNoValue(key, *bucket);
+        }
+    } else {
+        entry = zmalloc(sizeof(*entry) + metasize);
+        assert(entryIsNormal(entry)); /* Check alignment of allocation */
+        if (metasize &gt; 0) {
+            memset(dictEntryMetadata(entry), 0, metasize);
+        }
+        entry-&gt;key = key;
+        entry-&gt;next = *bucket;
+    }
+    *bucket = entry;
+    d-&gt;ht_used[htidx]++;
+
+    return entry;
+}
+</code></pre>
+<p>最后，dict的实现还为操作不同类型entry的value提供了多个函数，包括set、incr、get操作。</p>
+<h2 id="dict的rehash操作">dict的rehash操作</h2>
+<p>dict的rehash操作是渐进式的，也就是说不是一次性就将所有原本的key-value通过rehash移动到了新的表中，而是一次进行几步，直到将第一个表中的所有key-value都移动到了第二个表中。redis将rehash操作分散到了每次增删查改的操作当中，以及服务器空闲的时间。这样，在数据量很大时可以做到不影响性能。我们可以在前面插入操作的代码以及后面dict的查找操作中了解到这一点。</p>
+<p>下面按照代码进行分析。</p>
+<p>rehash操作通过int dictRehash(dict *d, int n)函数实现，如果原表中没有再需要移动的，则返回0，否则表示还有需要rehash操作的，返回1。</p>
+<p>首先第一段，判断该dict是否允许resize。其中empty_visits是本次rehash操作允许访问到的最大空bucket的数量（hash的index可能不是连续的）。</p>
+<p>随后，进行n步的rehash操作。首先找到下一个不为NULL的bucket（一个entry链表），然后对这个链表进行rehash并移动到第二个hash表中。</p>
+<p>最后，检查是否已经全部移动完毕，如果移动完毕，则将第二个表中的entry全部移动到第一个表中，并重置第二个表。</p>
+<pre><code class="language-c">int dictRehash(dict *d, int n) {
+    int empty_visits = n*10; /* Max number of empty buckets to visit. */
+    if (dict_can_resize == DICT_RESIZE_FORBID || !dictIsRehashing(d)) return 0;
+    if (dict_can_resize == DICT_RESIZE_AVOID &amp;&amp; 
+        (DICTHT_SIZE(d-&gt;ht_size_exp[1]) / DICTHT_SIZE(d-&gt;ht_size_exp[0]) &lt; dict_force_resize_ratio))
+    {
+        return 0;
+    }
+
+    while(n-- &amp;&amp; d-&gt;ht_used[0] != 0) {
+        dictEntry *de, *nextde;
+
+        /* Note that rehashidx can't overflow as we are sure there are more
+         * elements because ht[0].used != 0 */
+        assert(DICTHT_SIZE(d-&gt;ht_size_exp[0]) &gt; (unsigned long)d-&gt;rehashidx);
+        while(d-&gt;ht_table[0][d-&gt;rehashidx] == NULL) {
+            d-&gt;rehashidx++;
+            if (--empty_visits == 0) return 1;
+        }
+        de = d-&gt;ht_table[0][d-&gt;rehashidx];
+        /* Move all the keys in this bucket from the old to the new hash HT */
+        while(de) {
+            uint64_t h;
+
+            nextde = de-&gt;next;
+            /* Get the index in the new hash table */
+            h = dictHashKey(d, de-&gt;key) &amp; DICTHT_SIZE_MASK(d-&gt;ht_size_exp[1]);
+            de-&gt;next = d-&gt;ht_table[1][h];
+            d-&gt;ht_table[1][h] = de;
+            d-&gt;ht_used[0]--;
+            d-&gt;ht_used[1]++;
+            de = nextde;
+        }
+        d-&gt;ht_table[0][d-&gt;rehashidx] = NULL;
+        d-&gt;rehashidx++;
+    }
+
+    /* Check if we already rehashed the whole table... */
+    if (d-&gt;ht_used[0] == 0) {
+        zfree(d-&gt;ht_table[0]);
+        /* Copy the new ht onto the old one */
+        d-&gt;ht_table[0] = d-&gt;ht_table[1];
+        d-&gt;ht_used[0] = d-&gt;ht_used[1];
+        d-&gt;ht_size_exp[0] = d-&gt;ht_size_exp[1];
+        _dictReset(d, 1);
+        d-&gt;rehashidx = -1;
+        return 0;
+    }
+
+    /* More to rehash... */
+    return 1;
+}
+</code></pre>
+<h2 id="dict的查找">dict的查找</h2>
+<p>查找的逻辑比较简单，直接上代码。首先就可以看到调用了_dictRehashStep函数，进行1步的rehash。然后在第一个hash表中计算hash值，再和mask进行按位与操作得到index，并在链表中找到key匹配的项返回。如果链表遍历完了都没找到匹配的项，则判断是否在rehash，如果实在rehash则第二个表中可能有新的键值对没有找到，所以继续在第二个hash表中查找；否则，dict没有在rehash，也就是说第二个表中没有键值，则直接返回，说明键值不存在。</p>
+<pre><code class="language-c">dictEntry *dictFind(dict *d, const void *key)
+{
+    dictEntry *he;
+    uint64_t h, idx, table;
+
+    if (dictSize(d) == 0) return NULL; /* dict is empty */
+    if (dictIsRehashing(d)) _dictRehashStep(d);
+    h = dictHashKey(d, key);
+    for (table = 0; table &lt;= 1; table++) {
+        idx = h &amp; DICTHT_SIZE_MASK(d-&gt;ht_size_exp[table]);
+        he = d-&gt;ht_table[table][idx];
+        while(he) {
+            if (key==he-&gt;key || dictCompareKeys(d, key, he-&gt;key))
+                return he;
+            he = he-&gt;next;
+        }
+        if (!dictIsRehashing(d)) return NULL;
+    }
+    return NULL;
+}
+</code></pre>
+<h2 id="dict的删除">dict的删除</h2>
+<p>删除逻辑主要调用dictDelete函数，还有另一个比较相关的函数，dictUnlink函数。前者会直接释放被删除的entry的空间，而后者则不会直接释放，而会将该entry返回，让上层应用进行额外操作。二者都是通过dictGenericDelete函数实现的。</p>
+<p>下面主要分析dictGenericDelete函数，代码如下。首先，同样会检查是否在rehash阶段，是的话就进行一步rehash操作。</p>
+<p>否则的话，先计算hash，然后在第一个表中查找，如果找到了并且nofree为0，则直接释放空间。如果在第一个表中没有找到，则判断是否则rehash，如果是的话则在第二个表中进行查找。</p>
+<pre><code class="language-c">static dictEntry *dictGenericDelete(dict *d, const void *key, int nofree) {
+    uint64_t h, idx;
+    dictEntry *he, *prevHe;
+    int table;
+
+    /* dict is empty */
+    if (dictSize(d) == 0) return NULL;
+
+    if (dictIsRehashing(d)) _dictRehashStep(d);
+    h = dictHashKey(d, key);
+
+    for (table = 0; table &lt;= 1; table++) {
+        idx = h &amp; DICTHT_SIZE_MASK(d-&gt;ht_size_exp[table]);
+        he = d-&gt;ht_table[table][idx];
+        prevHe = NULL;
+        while(he) {
+            if (key==he-&gt;key || dictCompareKeys(d, key, he-&gt;key)) {
+                /* Unlink the element from the list */
+                if (prevHe)
+                    prevHe-&gt;next = he-&gt;next;
+                else
+                    d-&gt;ht_table[table][idx] = he-&gt;next;
+                if (!nofree) {
+                    dictFreeUnlinkedEntry(d, he);
+                }
+                d-&gt;ht_used[table]--;
+                return he;
+            }
+            prevHe = he;
+            he = he-&gt;next;
+        }
+        if (!dictIsRehashing(d)) break;
+    }
+    return NULL; /* not found */
+}
+</code></pre>
+<h2 id="dict的缩容">dict的缩容</h2>
+<p>这里主要看一下缩容的时机，因为缩容的实现dictResize也是调用dictExpand实现的。判断是否需要缩容的函数代码如下。其中HASHTABLE_MIN_FILL为10，即已经使用的大小/分配的大小的比例小于10%就会触发缩容操作。该函数位于server.c文件。</p>
+<pre><code class="language-c">int htNeedsResize(dict *dict) {
+    long long size, used;
+
+    size = dictSlots(dict);
+    used = dictSize(dict);
+    return (size &gt; DICT_HT_INITIAL_SIZE &amp;&amp;
+            (used*100/size &lt; HASHTABLE_MIN_FILL));
+}
+</code></pre>
+<h2 id="dict的遍历iterator">dict的遍历——iterator</h2>
+<p>dict的遍历有两种方式，这里先分析易于理解的iterator遍历方式。首先介绍dictIterator结构体，代码如下。d指向遍历的dict，index是当前entry在hash table中的索引，table指代两个table中第几个，safe是一个标志位，当为1时，允许在遍历过程中对dict进行修改，如果为0，则只允许读取操作。另外有一个比较陌生的字段，fingerprint，在非安全迭代器中使用，可以看作当前dict的一个状态。在初始化（第一次调用dictNext访问第一个entry时）时赋值，并在释放迭代器时检查迭代完成后的fingerprint和开始时是否相同，不相同则说明在非安全迭代过程中修改了dict，会在释放迭代器时报错。</p>
+<pre><code class="language-c">typedef struct dictIterator {
+    dict *d;
+    long index;
+    int table, safe;
+    dictEntry *entry, *nextEntry;
+    /* unsafe iterator fingerprint for misuse detection. */
+    unsigned long long fingerprint;
+} dictIterator;
+</code></pre>
+<p>然后介绍迭代器的创建，有两个相关的函数，一个用来获取普通迭代器，另一个用来获取安全迭代器。代码如下。比较简单，就不详细分析了。</p>
+<pre><code class="language-c">dictIterator *dictGetIterator(dict *d)
+{
+    dictIterator *iter = zmalloc(sizeof(*iter));
+
+    iter-&gt;d = d;
+    iter-&gt;table = 0;
+    iter-&gt;index = -1;
+    iter-&gt;safe = 0;
+    iter-&gt;entry = NULL;
+    iter-&gt;nextEntry = NULL;
+    return iter;
+}
+
+dictIterator *dictGetSafeIterator(dict *d) {
+    dictIterator *i = dictGetIterator(d);
+
+    i-&gt;safe = 1;
+    return i;
+}
+</code></pre>
+<p>其次是迭代的基本功能，依次下一个item，通过dictNext函数实现，代码如下。首先如果entry不为NULL，则直接将nextEntry赋值给entry，并让nextEntry指向下一个entry。如果entry为NULL，会在开始第一次访问时根据是否安全迭代器进行相应操作。安全迭代器会暂停当前的rehash操作，非安全迭代器会计算fingerprint。另外，如果当前hash表已经遍历完成，则会换下一个hash表从0开始遍历。</p>
+<pre><code class="language-c">dictEntry *dictNext(dictIterator *iter)
+{
+    while (1) {
+        if (iter-&gt;entry == NULL) {
+            if (iter-&gt;index == -1 &amp;&amp; iter-&gt;table == 0) {
+                if (iter-&gt;safe)
+                    dictPauseRehashing(iter-&gt;d);
+                else
+                    iter-&gt;fingerprint = dictFingerprint(iter-&gt;d);
+            }
+            iter-&gt;index++;
+            if (iter-&gt;index &gt;= (long) DICTHT_SIZE(iter-&gt;d-&gt;ht_size_exp[iter-&gt;table])) {
+                if (dictIsRehashing(iter-&gt;d) &amp;&amp; iter-&gt;table == 0) {
+                    iter-&gt;table++;
+                    iter-&gt;index = 0;
+                } else {
+                    break;
+                }
+            }
+            iter-&gt;entry = iter-&gt;d-&gt;ht_table[iter-&gt;table][iter-&gt;index];
+        } else {
+            iter-&gt;entry = iter-&gt;nextEntry;
+        }
+        if (iter-&gt;entry) {
+            /* We need to save the 'next' here, the iterator user
+             * may delete the entry we are returning. */
+            iter-&gt;nextEntry = iter-&gt;entry-&gt;next;
+            return iter-&gt;entry;
+        }
+    }
+    return NULL;
+}
+</code></pre>
+<h2 id="dict的遍历scan">dict的遍历——scan</h2>
+<p>前面的迭代器遍历会有一个问题，安全迭代器在迭代的过程中不允许rehash操作，而非安全迭代器在迭代过程中不允许对dict进行修改。并且，通过迭代器迭代一次整个dict可能会耗时过长。针对以上问题，redis提供了另一种迭代方式，允许在迭代过程中进行rehash操作。该遍历方式是由dictScan函数实现的，不过在分析源码之前，可以通过源码中该函数的注释了解scan遍历的原理。</p>
+<p>开始时使用一个为0的游标（cursor），函数内部会返回下一个可以访问的entry的index作为新的cursor。如果返回为0，则说明遍历完成。dictScan保证从遍历开始到结束，dict中的所有元素都会至少访问一次（又是同一个entry会被多次访问）。除此之外，还可以传入两个函数指针，在遍历节点时或者整理碎片时调用。</p>
+<p>计算下一个cursor的方法，代码如下。其中m0是第一个hash表的掩码，计算方法为hash表大小2的对数减一，由于hash表的大小为2的整数次方，所以掩码低位全为1。rev函数是将一个数的二进制位反转。</p>
+<pre><code class="language-c">v |= ~m0;
+v = rev(v);
+v++;
+v = rev(v);
+</code></pre>
+<p>这样做就算是在遍历的过程中dict经过了扩容或者是缩容的操作，也可以保证相同存在的元素都会被访问，具体的原因和详情这里不再介绍。</p>
+<p>dictScan函数在dict正在rehash阶段时，会先遍历小的那个hash表，再遍历大的那个hash表。如果dict没有在rehash，则直接遍历第一个hash表。</p>
+<p>另外，在一些特殊情况下，scan确实会导致统一entry被多次访问，但概率很小。</p>
+
+              </div>
+              <div class="toc-container">
+                <ul class="markdownIt-TOC">
+<li>
+<ul>
+<li><a href="#dict%E7%BB%93%E6%9E%84%E4%BD%93%E5%AE%9A%E4%B9%89">dict结构体定义</a></li>
+<li><a href="#dictentry%E7%BB%93%E6%9E%84%E4%BD%93%E5%AE%9A%E4%B9%89">dictEntry结构体定义</a></li>
+<li><a href="#dicttype%E7%BB%93%E6%9E%84%E4%BD%93%E5%AE%9A%E4%B9%89">dictType结构体定义</a></li>
+<li><a href="#dict%E7%9A%84%E5%88%9B%E5%BB%BA%E6%93%8D%E4%BD%9C">dict的创建操作</a></li>
+<li><a href="#dict%E6%89%A9%E5%B1%95%E6%93%8D%E4%BD%9C">dict扩展操作</a></li>
+<li><a href="#dict%E7%9A%84%E6%8F%92%E5%85%A5%E6%93%8D%E4%BD%9C">dict的插入操作</a></li>
+<li><a href="#dict%E7%9A%84rehash%E6%93%8D%E4%BD%9C">dict的rehash操作</a></li>
+<li><a href="#dict%E7%9A%84%E6%9F%A5%E6%89%BE">dict的查找</a></li>
+<li><a href="#dict%E7%9A%84%E5%88%A0%E9%99%A4">dict的删除</a></li>
+<li><a href="#dict%E7%9A%84%E7%BC%A9%E5%AE%B9">dict的缩容</a></li>
+<li><a href="#dict%E7%9A%84%E9%81%8D%E5%8E%86iterator">dict的遍历——iterator</a></li>
+<li><a href="#dict%E7%9A%84%E9%81%8D%E5%8E%86scan">dict的遍历——scan</a></li>
+</ul>
+</li>
+</ul>
+
+              </div>
+            </div>
+          </article>
+        </div>
+
+        
+          <div class="next-post">
+            <div class="next">下一篇</div>
+            <a href="https://zch273711.github.io/post/source_code_redis7.0_ziplist/">
+              <h3 class="post-title">
+                Redis7.0源码阅读笔记——ziplist
+              </h3>
+            </a>
+          </div>
+        
+
+        
+
+        <div class="site-footer">
+  Powered by <a href="https://github.com/getgridea/gridea" target="_blank">Gridea</a>
+  <a class="rss" href="https://zch273711.github.io/atom.xml" target="_blank">
+    <i class="ri-rss-line"></i> RSS
+  </a>
+</div>
+
+      </div>
+    </div>
+
+    <script>
+      hljs.initHighlightingOnLoad()
+
+      let mainNavLinks = document.querySelectorAll(".markdownIt-TOC a");
+
+      // This should probably be throttled.
+      // Especially because it triggers during smooth scrolling.
+      // https://lodash.com/docs/4.17.10#throttle
+      // You could do like...
+      // window.addEventListener("scroll", () => {
+      //    _.throttle(doThatStuff, 100);
+      // });
+      // Only not doing it here to keep this Pen dependency-free.
+
+      window.addEventListener("scroll", event => {
+        let fromTop = window.scrollY;
+
+        mainNavLinks.forEach((link, index) => {
+          let section = document.getElementById(decodeURI(link.hash).substring(1));
+          let nextSection = null
+          if (mainNavLinks[index + 1]) {
+            nextSection = document.getElementById(decodeURI(mainNavLinks[index + 1].hash).substring(1));
+          }
+          if (section.offsetTop <= fromTop) {
+            if (nextSection) {
+              if (nextSection.offsetTop > fromTop) {
+                link.classList.add("current");
+              } else {
+                link.classList.remove("current");    
+              }
+            } else {
+              link.classList.add("current");
+            }
+          } else {
+            link.classList.remove("current");
+          }
+        });
+      });
+
+    </script>
+  </body>
+</html>
